@@ -1476,6 +1476,56 @@ class MotionDBEngine {
 
   // ── UPDATE ────────────────────────────────────────────────────────────────
 
+  private applyRowUpdate(tname: string, tbl: DbTable, row: DbRow, patch: DbRow): void {
+    // FK child-reference check / cascade actions when a referenced column value changes
+    for (const [otherName, otherTbl] of Object.entries(this.schema)) {
+      if (otherName === '__views__' || !isDbTable(otherTbl)) continue;
+      for (const col of otherTbl.columns) {
+        if (!col.fk || col.fk.table !== tname) continue;
+        const oldVal = row[col.fk.col], newVal = patch[col.fk.col];
+        if (oldVal === newVal) continue;
+        const childRows = otherTbl.rows.filter(r => r[col.name] === oldVal);
+        if (!childRows.length) continue;
+        const action = (col.fk.onUpdate || 'NO ACTION').toUpperCase();
+        if (action === 'CASCADE') {
+          childRows.forEach(cr => { cr[col.name] = newVal; });
+        } else if (action === 'SET NULL') {
+          childRows.forEach(cr => { cr[col.name] = null; });
+        } else if (action === 'SET DEFAULT') {
+          childRows.forEach(cr => { cr[col.name] = col.default ?? null; });
+        } else {
+          throw new Error(`FOREIGN KEY constraint failed: cannot update '${tname}.${col.fk.col}' — table '${otherName}' has rows referencing value ${oldVal}`);
+        }
+      }
+    }
+
+    this.enforceConstraints(tbl, patch, row);
+    Object.assign(row, patch);
+  }
+
+  updateRowByReference(tableName: string, targetRow: DbRow, values: Record<string, unknown>): void {
+    const tname = tableName.toLowerCase();
+    const tbl = this.getTable(tname);
+    if (!tbl.rows.includes(targetRow)) throw new Error('This row is no longer in the table. Refresh and try again.');
+
+    const patch: DbRow = { ...targetRow };
+    Object.entries(values).forEach(([name, value]) => {
+      const col = tbl.columns.find(column => column.name === name.toLowerCase());
+      if (!col) throw new Error(`Unknown column '${name}'`);
+      patch[col.name] = this.coerceValue(value, col.type);
+    });
+
+    const snapshot = this._snapshot();
+    try {
+      this.applyRowUpdate(tname, tbl, targetRow, patch);
+      this._dirty = true;
+      this._lastChangeCount = 1;
+    } catch (error) {
+      this.schema = snapshot;
+      throw error;
+    }
+  }
+
   execUpdate(stmt: Extract<SqlStatement, { type: 'UPDATE' }>): SqlResult {
     const tname = stmt.table.toLowerCase();
     const tbl = this.getTable(tname);
@@ -1490,29 +1540,7 @@ class MotionDBEngine {
         if (!col) throw new Error(`Unknown column '${cn}'`);
         patch[cn] = this.coerceValue(this.evalExpr(s.val, ctx), col.type);
       });
-      // FK child-reference check / cascade actions when a referenced column value changes
-      for (const [otherName, otherTbl] of Object.entries(this.schema)) {
-        if (otherName === '__views__' || !isDbTable(otherTbl)) continue;
-        for (const col of otherTbl.columns) {
-          if (!col.fk || col.fk.table !== tname) continue;
-          const oldVal = row[col.fk.col], newVal = patch[col.fk.col];
-          if (oldVal === newVal) continue;
-          const childRows = otherTbl.rows.filter(r => r[col.name] === oldVal);
-          if (!childRows.length) continue;
-          const action = (col.fk.onUpdate || 'NO ACTION').toUpperCase();
-          if (action === 'CASCADE') {
-            childRows.forEach(cr => { cr[col.name] = newVal; });
-          } else if (action === 'SET NULL') {
-            childRows.forEach(cr => { cr[col.name] = null; });
-          } else if (action === 'SET DEFAULT') {
-            childRows.forEach(cr => { cr[col.name] = col.default ?? null; });
-          } else {
-            throw new Error(`FOREIGN KEY constraint failed: cannot update '${tname}.${col.fk.col}' — table '${otherName}' has rows referencing value ${oldVal}`);
-          }
-        }
-      }
-      this.enforceConstraints(tbl, patch, row);
-      Object.assign(row, patch);
+      this.applyRowUpdate(tname, tbl, row, patch);
       count++;
     });
     this._lastChangeCount = count;
@@ -4393,8 +4421,12 @@ class MotionDatabaseView extends ItemView {
     const controls = el.createDiv({ cls: 'mdb-sql-controls' });
     const runBtn = controls.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
     setButtonContent(runBtn, 'play', 'Run');
+    runBtn.type = 'button';
     const clearBtn = controls.createEl('button', { cls: 'mdb-btn' });
     setButtonContent(clearBtn, 'eraser', 'Clear');
+    clearBtn.type = 'button';
+    clearBtn.setAttribute('aria-label', 'Clear query and results');
+    clearBtn.title = 'Clear query and results';
 
     const snippetsEl = controls.createDiv({ cls: 'mdb-sql-snippets' });
     const snippets: Array<[string, string]> = [
@@ -4406,11 +4438,19 @@ class MotionDatabaseView extends ItemView {
     ];
     snippets.forEach(([label, sql]) => {
       const btn = snippetsEl.createEl('button', { cls: 'mdb-snippet-btn', text: label });
+      btn.type = 'button';
       btn.onclick = () => { textarea.value = sql; textarea.focus(); };
     });
 
     // Output area — newest on top
     const outputEl = el.createDiv({ cls: 'mdb-sql-output' });
+    const clearTerminal = () => {
+      textarea.value = '';
+      outputEl.empty();
+      this.sqlOutputBlocks = [];
+      this.historyIdx = -1;
+      textarea.focus();
+    };
 
     // Restore persisted output blocks — prepend oldest first so newest ends up on top
     if (this.sqlOutputBlocks && this.sqlOutputBlocks.length) {
@@ -4435,8 +4475,7 @@ class MotionDatabaseView extends ItemView {
       const metaResult = this.handleMetaCommand(raw);
       if (metaResult !== null) {
         if (metaResult === '__CLEAR__') {
-          outputEl.empty();
-          this.sqlOutputBlocks = [];
+          clearTerminal();
           return;
         }
         if (metaResult === '__HISTORY__') {
@@ -4501,8 +4540,18 @@ class MotionDatabaseView extends ItemView {
       }
     };
 
+    const executeFromUI = () => {
+      void runSQL().catch(error => {
+        this._storeAndPrependBlock(outputEl, {
+          type: 'error',
+          sql: textarea.value.trim() || null,
+          message: errorMessage(error),
+        });
+      });
+    };
+
     textarea.onkeydown = e => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); void runSQL(); return; }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); executeFromUI(); return; }
       if (e.key === 'ArrowUp' && e.ctrlKey) {
         e.preventDefault();
         if (this.historyIdx < this.sqlHistory.length - 1) { this.historyIdx++; textarea.value = this.sqlHistory[this.historyIdx]; }
@@ -4516,8 +4565,8 @@ class MotionDatabaseView extends ItemView {
       }
     };
 
-    runBtn.onclick = () => { void runSQL(); };
-    clearBtn.onclick = () => { outputEl.empty(); this.sqlOutputBlocks = []; };
+    runBtn.onclick = executeFromUI;
+    clearBtn.onclick = clearTerminal;
     textarea.focus();
   }
 
@@ -4688,6 +4737,10 @@ class MotionDatabaseView extends ItemView {
     const importBtn = actions.createEl('button', { cls: 'mdb-btn' });
     setButtonContent(importBtn, 'upload', 'Import');
     importBtn.onclick = () => this.importCSV(tableName);
+    const addRowBtn = actions.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
+    setButtonContent(addRowBtn, 'plus', 'Add row');
+    addRowBtn.type = 'button';
+    addRowBtn.setAttribute('aria-label', 'Go to new row');
 
     // Column strip
     const colRow = el.createDiv({ cls: 'mdb-col-strip' });
@@ -4756,23 +4809,26 @@ class MotionDatabaseView extends ItemView {
         const inp = document.createEl('input');
         inp.type = 'checkbox';
         inp.className = 'mdb-cell-check';
-        inp.checked = !!value;
+        inp.checked = value === true || value === 1 || value === '1' || value === 'true';
         inputMap[c.name] = inp;
         return inp;
       }
       // Default — text input
       const inp = document.createEl('input');
       inp.className = 'mdb-cell-input';
-      inp.value = value !== null && value !== undefined ? String(value) : '';
+      const initialValue = value !== null && value !== undefined ? String(value) : '';
       inp.placeholder = c.notNull ? (c.default !== undefined ? String(c.default) : '') : 'NULL';
       if (c.type === 'INTEGER' || c.type === 'REAL') inp.inputMode = 'decimal';
       if (presentation?.type === 'rating') {
-        inp.type = 'number';
-        inp.min = '0';
-        inp.max = String(presentation.max || 5);
-        inp.step = '1';
+        if (!initialValue || Number.isFinite(Number(initialValue))) {
+          inp.type = 'number';
+          inp.min = '0';
+          inp.max = String(presentation.max || 5);
+          inp.step = '1';
+        }
       }
-      if (c.type === 'DATE') inp.type = 'date';
+      if (c.type === 'DATE' && (!initialValue || /^\d{4}-\d{2}-\d{2}$/.test(initialValue))) inp.type = 'date';
+      inp.value = initialValue;
       inputMap[c.name] = inp;
       return inp;
     };
@@ -4817,14 +4873,14 @@ class MotionDatabaseView extends ItemView {
         // Click on non-PK cell to enter edit mode
         if (!c.pk && !c.ai) {
           td.classList.add('is-editable');
-          td.onclick = () => { if (!editMode) enterEdit(); };
+          td.onclick = () => { if (!editMode) enterEdit(c.name); };
           td.tabIndex = 0;
           td.setAttribute('aria-label', `Edit ${c.name}`);
           td.onkeydown = event => {
             if (event.target !== td) return;
             if (event.key === 'Enter' || event.key === ' ') {
               event.preventDefault();
-              if (!editMode) enterEdit();
+              if (!editMode) enterEdit(c.name);
             }
           };
         }
@@ -4833,7 +4889,7 @@ class MotionDatabaseView extends ItemView {
 
       const actTd = tr.createEl('td', { cls: 'mdb-td mdb-td-act' });
 
-      const enterEdit = () => {
+      const enterEdit = (focusColumnName?: string) => {
         if (editMode) return;
         editMode = true;
         tr.addClass('mdb-tr-editing');
@@ -4854,9 +4910,11 @@ class MotionDatabaseView extends ItemView {
         const saveBtn = actTd.createEl('button', { cls: 'mdb-cell-save' });
         setIcon(saveBtn, 'check');
         saveBtn.title = 'Save changes';
+        saveBtn.setAttribute('aria-label', 'Save row changes');
         const cancelBtn = actTd.createEl('button', { cls: 'mdb-cell-cancel' });
         setIcon(cancelBtn, 'x');
         cancelBtn.title = 'Cancel changes';
+        cancelBtn.setAttribute('aria-label', 'Cancel row changes');
 
         // Tab navigation across editable inputs
         const inputs = cellTds
@@ -4876,7 +4934,8 @@ class MotionDatabaseView extends ItemView {
             }
           };
         });
-        if (inputs[0]) inputs[0].focus();
+        const focusInput = (focusColumnName ? inputMap[focusColumnName] : null) || inputs[0];
+        focusInput?.focus();
 
         saveBtn.onclick = saveEdit;
         cancelBtn.onclick = cancelEdit;
@@ -4884,22 +4943,30 @@ class MotionDatabaseView extends ItemView {
 
       const saveEdit = async () => {
         const pkCol = tbl.columns.find(c => c.pk);
-        if (!pkCol) { cancelEdit(); return; }
+        const editableColumns = tbl.columns.filter(c => !c.pk && !c.ai);
         try {
-          const sets = tbl.columns.filter(c => !c.pk && !c.ai).map(c => `${c.name} = ${readVal(c, inputMap)}`).join(', ');
-          const pkVal = row[pkCol.name];
-          const pkLit = typeof pkVal === 'number' ? String(pkVal) : `'${String(pkVal).replace(/'/g, "''")}'`;
-          this.db.exec(`UPDATE ${tableName} SET ${sets} WHERE ${pkCol.name} = ${pkLit}`);
-          // Update the row object in place so re-render is not needed
-          tbl.columns.filter(c => !c.pk && !c.ai).forEach(c => {
-            const inp = inputMap[c.name];
-            if (!inp) return;
-            const raw = inp.type === 'checkbox' ? (inp.checked ? 1 : 0) : inp.value;
-            row[c.name] = raw === '' ? null : (c.type === 'INTEGER' || c.type === 'REAL') && !isNaN(Number(raw)) ? Number(raw) : raw;
-          });
+          if (pkCol) {
+            const sets = editableColumns.map(c => `${c.name} = ${readVal(c, inputMap)}`).join(', ');
+            const pkVal = row[pkCol.name];
+            const pkLit = typeof pkVal === 'number' ? String(pkVal) : `'${String(pkVal).replace(/'/g, "''")}'`;
+            this.db.exec(`UPDATE ${tableName} SET ${sets} WHERE ${pkCol.name} = ${pkLit}`);
+          } else {
+            const values: Record<string, unknown> = {};
+            editableColumns.forEach(column => {
+              const input = inputMap[column.name];
+              if (!input) return;
+              values[column.name] = input.type === 'checkbox'
+                ? (input.checked ? 1 : 0)
+                : input.value === '' ? null : input.value;
+            });
+            this.db.engine.updateRowByReference(tableName, row, values);
+          }
           exitEditDisplay();
           this._scheduleSave();
-        } catch (e) { new Notice(`Error: ${errorMessage(e)}`); }
+        } catch (e) {
+          new Notice(`Could not save row: ${errorMessage(e)}`);
+          this.render();
+        }
       };
 
       const cancelEdit = () => { exitEditDisplay(); };
@@ -4970,6 +5037,7 @@ class MotionDatabaseView extends ItemView {
     const doInsertBtn = insertActTd.createEl('button', { cls: 'mdb-cell-save' });
     setIcon(doInsertBtn, 'plus');
     doInsertBtn.title = 'Insert row';
+    doInsertBtn.setAttribute('aria-label', 'Insert row');
 
     const doInsert = async (focusAfter = true) => {
       try {
@@ -4981,6 +5049,7 @@ class MotionDatabaseView extends ItemView {
         // Use the same controls/edit handlers as existing rows, without
         // rebuilding the table or using a second SQL deletion path.
         const newRow = tbl.rows[tbl.rows.length - 1];
+        if (!newRow) throw new Error('The database did not return the inserted row.');
         const newTr = renderDataRow(newRow, tbl.rows.length - 1, insertRow);
         newTr.addClass('mdb-tr-flash');
         window.setTimeout(() => newTr.classList.remove('mdb-tr-flash'), 600);
@@ -5018,6 +5087,12 @@ class MotionDatabaseView extends ItemView {
         }
       };
     });
+
+    addRowBtn.onclick = () => {
+      insertRow.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      const firstEditableColumn = tbl.columns.find(column => !column.ai);
+      if (firstEditableColumn) insertInputMap[firstEditableColumn.name]?.focus();
+    };
   }
 
   async onClose() {
