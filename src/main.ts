@@ -3500,6 +3500,7 @@ class MotionDatabaseView extends ItemView {
     // like the home view header.
     const workspaceHeader = root.createDiv({ cls: 'mdb-home-header mdb-workspace-header' });
     const backBtn = workspaceHeader.createEl('button', { cls: 'clickable-icon mdb-workspace-back' });
+    backBtn.type = 'button';
     setIcon(backBtn, 'arrow-left');
     backBtn.setAttribute('aria-label', 'Back to databases');
     backBtn.onclick = () => this.plugin.openHome();
@@ -3507,11 +3508,10 @@ class MotionDatabaseView extends ItemView {
     const headerIcon = workspaceHeader.createDiv({ cls: 'mdb-home-logo mdb-workspace-logo' });
     setIcon(headerIcon, 'database');
     const headerIdentity = workspaceHeader.createDiv({ cls: 'mdb-home-title-wrap' });
-    const titleEl = headerIdentity.createSpan({ cls: 'mdb-home-title mdb-workspace-title', text: db.name });
-    headerIdentity.createDiv({ cls: 'mdb-home-subtitle', text: 'Local database' });
-    const savedState = workspaceHeader.createDiv({ cls: 'mdb-workspace-status' });
-    setIcon(savedState, 'hard-drive');
-    savedState.createSpan({ text: 'Vault file' });
+    const titleEl = headerIdentity.createEl('h1', { cls: 'mdb-home-title mdb-workspace-title', text: db.name });
+    titleEl.setAttribute('aria-label', 'Database name. Click to rename.');
+    titleEl.title = 'Click to rename database';
+    headerIdentity.createDiv({ cls: 'mdb-home-subtitle', text: 'Stored in this vault' });
 
     titleEl.contentEditable = 'true'; titleEl.spellcheck = false;
     let nameBlurHandled = false;
@@ -3546,10 +3546,12 @@ class MotionDatabaseView extends ItemView {
       return el;
     };
     const navItem = (label: string, icon: string, id: string): HTMLDivElement => {
-      const el = sidebarItem(sidebar, 'mdb-nav-item' + (this.activeTab === id ? ' is-active' : ''), () => {
+      const isActive = this.activeTab === id;
+      const el = sidebarItem(sidebar, isActive ? 'is-active' : '', () => {
         this.activeTab = id;
         this.render();
       });
+      if (isActive) el.setAttribute('aria-current', 'page');
       const iconEl = el.createSpan({ cls: 'mdb-nav-icon' });
       setIcon(iconEl, icon);
       el.createSpan({ cls: 'mdb-nav-label', text: label });
@@ -3562,12 +3564,15 @@ class MotionDatabaseView extends ItemView {
     navItem('Relationships', 'workflow', 'erd');
     navItem('SQL reference', 'book-open', 'cheatsheet');
 
-    // New table + Import CSV Settings-style actions
-    const newTblBtn = sidebarItem(sidebar, 'mdb-nav-item mdb-sidebar-action', () => {
+    // New table and CSV actions sit below the native vertical navigation.
+    const sidebarActions = sidebar.createDiv({ cls: 'mdb-sidebar-actions' });
+    const newTblBtn = sidebarItem(sidebarActions, 'mdb-sidebar-action', () => {
       new NewTableModal(this.app, db, () => this.persistAndRender()).open();
     });
+    newTblBtn.setAttribute('aria-label', 'Create a new table');
     setButtonContent(newTblBtn, 'plus', 'New table');
-    const importSideBtn = sidebarItem(sidebar, 'mdb-nav-item mdb-sidebar-action', () => this.importCSV());
+    const importSideBtn = sidebarItem(sidebarActions, 'mdb-sidebar-action', () => this.importCSV());
+    importSideBtn.setAttribute('aria-label', 'Import CSV data');
     setButtonContent(importSideBtn, 'upload', 'Import CSV');
 
     // ── Content ──
@@ -4342,11 +4347,13 @@ class MotionDatabaseView extends ItemView {
   renderTablesOverview(el: HTMLElement): void {
     const hdr = el.createDiv({ cls: 'mdb-content-hdr' });
     hdr.createEl('h2', { cls: 'mdb-content-title', text: 'Tables' });
-    const newBtn = hdr.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
+    const newBtn = hdr.createEl('button', { cls: 'mod-cta' });
     setButtonContent(newBtn, 'plus', 'New table');
+    newBtn.type = 'button';
     newBtn.onclick = () => new NewTableModal(this.app, this.db, () => this.persistAndRender()).open();
-    const importBtn = hdr.createEl('button', { cls: 'mdb-btn' });
+    const importBtn = hdr.createEl('button');
     setButtonContent(importBtn, 'upload', 'Import CSV');
+    importBtn.type = 'button';
     importBtn.onclick = () => this.importCSV();
 
     const db = this.db;
@@ -4359,11 +4366,13 @@ class MotionDatabaseView extends ItemView {
       empty.createEl('h3', { text: 'No tables yet' });
       empty.createEl('p', { text: 'Create a table or import existing CSV data.' });
       const row = empty.createDiv({ cls: 'mdb-empty-actions' });
-      const csvBtn = row.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
+      const csvBtn = row.createEl('button');
       setButtonContent(csvBtn, 'upload', 'Import CSV');
+      csvBtn.type = 'button';
       csvBtn.onclick = () => this.importCSV();
-      const sqlBtn = row.createEl('button', { cls: 'mdb-btn' });
+      const sqlBtn = row.createEl('button', { cls: 'mod-cta' });
       setButtonContent(sqlBtn, 'square-terminal', 'Open SQL');
+      sqlBtn.type = 'button';
       sqlBtn.onclick = () => { this.activeTab = 'sql'; this.render(); };
       return;
     }
@@ -4372,34 +4381,29 @@ class MotionDatabaseView extends ItemView {
     tables.forEach(t => {
       const tbl = db.tableData(t);
       if (!tbl) return;
-      const card = grid.createDiv({ cls: 'mdb-table-card' });
-      const ch = card.createDiv({ cls: 'mdb-table-card-hdr' });
-      const cardIcon = ch.createSpan({ cls: 'mdb-table-card-icon' });
-      setIcon(cardIcon, 'table-2');
-      ch.createSpan({ cls: 'mdb-table-card-name', text: t });
-      ch.createSpan({
-        cls: 'mdb-table-card-count',
-        text: `${tbl.rows.length} ${tbl.rows.length === 1 ? 'row' : 'rows'}`,
-      });
-
-      const actions = card.createDiv({ cls: 'mdb-table-card-actions' });
-      const openBtn = actions.createEl('button', { cls: 'mdb-btn' });
-      setButtonContent(openBtn, 'arrow-right', 'Open');
-      openBtn.onclick = () => { this.activeTab = t; this.render(); };
-      const descBtn = actions.createEl('button', { cls: 'mdb-btn' });
-      setButtonContent(descBtn, 'text-search', 'Describe');
-      descBtn.onclick = () => { this.activeTab = 'sql'; this.sqlInitial = `DESCRIBE ${t};`; this.render(); };
-      const dropBtn = actions.createEl('button', { cls: 'mdb-btn mdb-btn-danger mdb-btn-icon' });
-      setIcon(dropBtn, 'trash-2');
-      dropBtn.setAttribute('aria-label', `Delete ${t}`);
-      dropBtn.title = 'Delete table';
-      dropBtn.onclick = () => {
-        const modal = new ConfirmModal(this.app, `Drop table "${t}"? This cannot be undone.`, async () => {
-          this.db.exec(`DROP TABLE ${t}`);
-          await this.persistAndRender();
-        });
-        modal.open();
-      };
+      const setting = new Setting(grid)
+        .setClass('mdb-table-setting')
+        .setName(t)
+        .setDesc(`${tbl.columns.length} ${tbl.columns.length === 1 ? 'column' : 'columns'} · ${tbl.rows.length} ${tbl.rows.length === 1 ? 'row' : 'rows'}`);
+      setting
+        .addButton(button => button
+          .setButtonText('Open')
+          .setIcon('arrow-right')
+          .setCta()
+          .onClick(() => { this.activeTab = t; this.render(); }))
+        .addExtraButton(button => button
+          .setIcon('text-search')
+          .setTooltip(`Describe ${t}`)
+          .onClick(() => { this.activeTab = 'sql'; this.sqlInitial = `DESCRIBE ${t};`; this.render(); }))
+        .addExtraButton(button => button
+          .setIcon('trash-2')
+          .setTooltip(`Delete ${t}`)
+          .onClick(() => {
+            new ConfirmModal(this.app, `Drop table "${t}"? This cannot be undone.`, async () => {
+              this.db.exec(`DROP TABLE ${t}`);
+              await this.persistAndRender();
+            }).open();
+          }));
     });
   }
 
@@ -4414,17 +4418,17 @@ class MotionDatabaseView extends ItemView {
     titleWrap.createSpan({ cls: 'mdb-sql-prompt-db', text: db.name });
 
     // Editor
-    const textarea = el.createEl('textarea', { cls: 'mdb-sql-editor' });
+    const textarea = el.createEl('textarea', { cls: 'text-input mdb-sql-editor' });
     textarea.placeholder = 'Write a SQL query…';
     textarea.value = this.sqlInitial || '';
     this.sqlInitial = null;
 
     // Controls
     const controls = el.createDiv({ cls: 'mdb-sql-controls' });
-    const runBtn = controls.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
+    const runBtn = controls.createEl('button', { cls: 'mod-cta' });
     setButtonContent(runBtn, 'play', 'Run');
     runBtn.type = 'button';
-    const clearBtn = controls.createEl('button', { cls: 'mdb-btn' });
+    const clearBtn = controls.createEl('button');
     setButtonContent(clearBtn, 'eraser', 'Clear');
     clearBtn.type = 'button';
     clearBtn.setAttribute('aria-label', 'Clear query and results');
@@ -4439,7 +4443,7 @@ class MotionDatabaseView extends ItemView {
       ['DESCRIBE', 'DESCRIBE '],
     ];
     snippets.forEach(([label, sql]) => {
-      const btn = snippetsEl.createEl('button', { cls: 'mdb-snippet-btn', text: label });
+      const btn = snippetsEl.createEl('button', { text: label });
       btn.type = 'button';
       btn.onclick = () => { textarea.value = sql; textarea.focus(); };
     });
@@ -4705,19 +4709,23 @@ class MotionDatabaseView extends ItemView {
     const metaEl = hdr.createSpan({ cls: 'mdb-table-meta', text: `${tbl.columns.length} columns · ${tbl.rows.length} rows` });
 
     const actions = hdr.createDiv({ cls: 'mdb-hdr-actions' });
-    const structBtn = actions.createEl('button', { cls: 'mdb-btn' });
+    const structBtn = actions.createEl('button');
     setButtonContent(structBtn, 'columns-3', 'Structure');
+    structBtn.type = 'button';
     structBtn.onclick = () => new StructureModal(this.app, this.db, tableName, () => this.persistAndRender()).open();
-    const sqlBtn = actions.createEl('button', { cls: 'mdb-btn' });
+    const sqlBtn = actions.createEl('button');
     setButtonContent(sqlBtn, 'square-terminal', 'Query');
+    sqlBtn.type = 'button';
     sqlBtn.onclick = () => { this.activeTab = 'sql'; this.sqlInitial = `SELECT * FROM ${tableName} LIMIT 100;`; this.render(); };
-    const exportBtn = actions.createEl('button', { cls: 'mdb-btn' });
+    const exportBtn = actions.createEl('button');
     setButtonContent(exportBtn, 'download', 'Export');
+    exportBtn.type = 'button';
     exportBtn.onclick = () => this.exportCSV(tableName);
-    const importBtn = actions.createEl('button', { cls: 'mdb-btn' });
+    const importBtn = actions.createEl('button');
     setButtonContent(importBtn, 'upload', 'Import');
+    importBtn.type = 'button';
     importBtn.onclick = () => this.importCSV(tableName);
-    const addRowBtn = actions.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
+    const addRowBtn = actions.createEl('button', { cls: 'mod-cta' });
     setButtonContent(addRowBtn, 'plus', 'Add row');
     addRowBtn.type = 'button';
     addRowBtn.setAttribute('aria-label', 'Go to new row');

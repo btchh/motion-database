@@ -1,5 +1,5 @@
-# Motion Database 2.3.11
+# Motion Database 2.3.12
 
-- Replace the database home hero and inline creation form with a focused, theme-aware database list and a standard Obsidian modal for creating databases.
-- Use Obsidian setting rows and native Open, Rename, and Delete controls so the page follows the active theme.
-- Show the database storage folder and inline validation feedback in the creation dialog.
+- Refresh the open database workspace with native Obsidian navigation, setting rows, buttons, and inputs so it follows the active theme.
+- Improve workspace hierarchy with a clear editable database title, compact storage context, and simpler table actions.
+- Keep the SQL editor and table toolbar consistent with Obsidian controls while preserving the existing query and table workflows.

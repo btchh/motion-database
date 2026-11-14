@@ -3828,3 +3828,97 @@ body.is-mobile :is(.mdb-del-btn,.mdb-query-delete-button) svg {
  width:20px;
  height:20px;
 }
+
+/* Open database workspace follows Obsidian's settings and table conventions. */
+.mdb-workspace-header {
+  gap: var(--size-4-2);
+}
+.mdb-workspace-title {
+  display: block;
+  width: fit-content;
+  max-width: min(60vw, 640px);
+  margin: 0;
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+  line-height: var(--line-height-tight);
+}
+.mdb-workspace-title:focus {
+  margin: 0;
+}
+.mdb-layout {
+  min-height: 0;
+}
+.mdb-sidebar {
+  width: 220px;
+  padding: var(--size-4-3) var(--size-4-2);
+}
+.mdb-sidebar .vertical-tab-nav-item {
+  min-width: 0;
+  margin: 0;
+}
+.mdb-sidebar .mdb-nav-icon {
+  color: var(--icon-color);
+}
+.mdb-sidebar .vertical-tab-nav-item.is-active .mdb-nav-icon {
+  color: var(--icon-color-active, var(--text-accent));
+}
+.mdb-sidebar-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+  margin-top: auto;
+  padding-top: var(--size-4-3);
+  border-top: 1px solid var(--background-modifier-border);
+}
+.mdb-content {
+  min-width: 0;
+  padding: var(--size-4-5) var(--size-4-6);
+}
+.mdb-content-hdr {
+  align-items: center;
+  gap: var(--size-4-2);
+  margin-bottom: var(--size-4-5);
+}
+.mdb-hdr-actions {
+  gap: var(--size-4-2);
+}
+.mdb-tables-grid {
+  gap: 0;
+  border-top: 0;
+}
+.mdb-table-setting {
+  min-width: 0;
+}
+.mdb-sql-editor {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+}
+
+@media (max-width: 760px) {
+  .mdb-sidebar {
+    width: 100%;
+    max-width: none;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--size-2-1);
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: var(--size-4-2);
+    border-right: 0;
+    border-bottom: 1px solid var(--background-modifier-border);
+  }
+  .mdb-sidebar > .vertical-tab-nav-item {
+    width: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  .mdb-sidebar-actions {
+    display: none;
+  }
+  .mdb-content {
+    padding: var(--size-4-4);
+  }
+  .mdb-workspace-title {
+    max-width: min(65vw, 420px);
+  }
+}
