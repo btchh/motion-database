@@ -1,0 +1,9 @@
+{
+  "id": "motion-database",
+  "name": "Motion Database",
+  "version": "2.3.0",
+  "minAppVersion": "1.0.0",
+  "description": "Create and query local relational databases with SQL, tables, foreign keys, views, and note embeds.",
+  "author": "btchh",
+  "isDesktopOnly": false
+}
