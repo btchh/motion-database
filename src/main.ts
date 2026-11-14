@@ -3081,10 +3081,14 @@ class MotionDatabaseView extends ItemView {
 
     titleEl.contentEditable = 'true'; titleEl.spellcheck = false;
     let nameBlurHandled = false;
-    titleEl.onblur = async () => {
+    titleEl.onblur = () => {
       if (nameBlurHandled) return;
       nameBlurHandled = true;
-      this.db.name = titleEl.textContent.trim() || 'Untitled'; await this.persistAndRender();
+      this.db.name = titleEl.textContent.trim() || 'Untitled';
+      void this.persistAndRender().catch(error => {
+        console.error('[MotionDB] Could not save the database name:', error);
+        new Notice('Could not save the database name.');
+      });
     };
     titleEl.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); titleEl.blur(); } };
 
@@ -4060,8 +4064,8 @@ class MotionDatabaseView extends ItemView {
       }
     };
 
-    textarea.onkeydown = async e => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); await runSQL(); return; }
+    textarea.onkeydown = e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); void runSQL(); return; }
       if (e.key === 'ArrowUp' && e.ctrlKey) {
         e.preventDefault();
         if (this.historyIdx < this.sqlHistory.length - 1) { this.historyIdx++; textarea.value = this.sqlHistory[this.historyIdx]; }
@@ -4075,7 +4079,7 @@ class MotionDatabaseView extends ItemView {
       }
     };
 
-    runBtn.onclick = runSQL;
+    runBtn.onclick = () => { void runSQL(); };
     clearBtn.onclick = () => { outputEl.empty(); this.sqlOutputBlocks = []; };
     textarea.focus();
   }
@@ -4106,18 +4110,6 @@ class MotionDatabaseView extends ItemView {
       meta.className = 'mdb-sql-echo-meta';
       meta.textContent = [block.timestamp, block.elapsed != null ? `${block.elapsed}ms` : null].filter(Boolean).join(' · ');
       echo.appendChild(meta);
-      const copyBtn = createEl('button');
-      copyBtn.className = 'mdb-echo-copy-btn';
-      copyBtn.title = 'Copy SQL';
-      setIcon(copyBtn, 'copy');
-      copyBtn.onclick = () => {
-        void navigator.clipboard?.writeText(block.sql).catch(error => {
-          console.warn('[MotionDB] Could not copy SQL to clipboard:', error);
-        });
-        setIcon(copyBtn, 'check');
-        window.setTimeout(() => setIcon(copyBtn, 'copy'), 1200);
-      };
-      echo.appendChild(copyBtn);
       wrap.appendChild(echo);
     }
 
@@ -5771,8 +5763,14 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     this.registerMarkdownCodeBlockProcessor('motiondb', (source, el, context) => {
       context.addChild(new MotionDatabaseEmbed(el, this, source, context.sourcePath));
     });
-    this.addCommand({ id: 'mdb-home', name: 'Home', callback: () => this.openHome() });
-    this.addCommand({ id: 'mdb-open', name: 'Open or create', callback: () => this.openHome() });
+    const openHomeFromCommand = () => {
+      void this.openHome().catch(error => {
+        console.error('[MotionDB] Could not open the home view:', error);
+        new Notice('Could not open Motion Database.');
+      });
+    };
+    this.addCommand({ id: 'mdb-home', name: 'Home', callback: openHomeFromCommand });
+    this.addCommand({ id: 'mdb-open', name: 'Open or create', callback: openHomeFromCommand });
     this.addCommand({
       id: 'prefix-selected-lines-blockquote',
       name: 'Editor: Prefix selected lines with blockquote',
@@ -5793,7 +5791,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
         );
       },
     });
-    this.addRibbonIcon('database', 'Motion Database', () => this.openHome());
+    this.addRibbonIcon('database', 'Motion Database', openHomeFromCommand);
 
     // After workspace finishes restoring, detach any db leaves with no db loaded.
     // These are zombies from a previous session's saved workspace state.

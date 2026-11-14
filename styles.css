@@ -898,24 +898,6 @@
   white-space: nowrap;
   flex-shrink: 0;
 }
-.mdb-echo-copy-btn {
-  background: none;
-  border: none;
-  color: var(--text-faint);
-  cursor: pointer;
-  font-size: var(--font-ui-small);
-  padding: 2px 5px;
-  border-radius: 4px;
-  flex-shrink: 0;
-  transition:
-    color 0.1s,
-    background 0.1s;
-}
-.mdb-echo-copy-btn:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
 .mdb-sql-ok {
   display: flex;
   align-items: center;
@@ -2758,8 +2740,7 @@
 }
 .mdb-cell-save,
 .mdb-cell-cancel,
-.mdb-del-btn,
-.mdb-echo-copy-btn {
+.mdb-del-btn {
   width: var(--clickable-icon-size, 30px);
   height: var(--clickable-icon-size, 30px);
   padding: var(--clickable-icon-padding, 6px);
