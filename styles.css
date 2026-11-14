@@ -3902,7 +3902,13 @@ body.is-mobile :is(.mdb-del-btn,.mdb-query-delete-button) svg {
     display: flex;
   }
   .mdb-sidebar .vertical-tab-header-group {
-    display: contents;
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--size-2-1);
+    margin: 0;
+    padding: 0;
   }
   .mdb-sidebar .vertical-tab-header-group-title {
     display: none;

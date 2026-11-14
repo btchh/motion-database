@@ -1,4 +1,4 @@
-# Motion Database 2.3.13
+# Motion Database 2.3.14
 
 - Match the database sidebar to Obsidian Settings with native vertical tab groups, section labels, and navigation spacing.
-- Keep mobile navigation horizontally scrollable and hide desktop-only sidebar actions on narrow panes.
+- Use flex groups for narrow-pane navigation while keeping the mobile sidebar horizontally scrollable.
