@@ -527,6 +527,9 @@
   white-space: nowrap;
   font-size: var(--font-ui-small);
 }
+.mdb-td.is-editable {
+  cursor: text;
+}
 .mdb-td:last-child {
   border-right: none;
 }
@@ -1132,7 +1135,7 @@
   user-select: none;
   box-shadow: var(--shadow-s);
 }
-.mdb-erd-wrap:active {
+.mdb-erd-wrap.is-panning {
   cursor: grabbing;
 }
 .mdb-erd-svg {
@@ -3781,6 +3784,9 @@ body .block-language-motiondb .mdb-query-table th.mdb-query-action-cell { z-inde
 /* Let an overflowing embed use natural column widths. Cell caps still wrap
  * long prose; short labels and values need not collapse toward a shared floor. */
 .block-language-motiondb .mdb-query-table { width:max-content !important; }
+
+/* Query output keeps its natural column widths and grows to the available pane width. */
+.mdb-query-table.mdb-query-table-natural-width { width:max-content !important; }
 
 /* Keep the trash glyph readable independently of the button's hit area. */
 body :is(.mdb-del-btn,.mdb-query-delete-button) { --icon-size:18px; }

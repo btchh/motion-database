@@ -3396,7 +3396,7 @@ class MotionDatabaseView extends ItemView {
     wrap.onmousedown = (e) => {
       if (e.target.closest('g[data-table]')) return;
       dragging = true; lastX = e.clientX; lastY = e.clientY;
-      wrap.style.cursor = 'grabbing';
+      wrap.classList.add('is-panning');
     };
 
     // Use named handlers so we can remove them when this ERD instance is torn down
@@ -3408,7 +3408,10 @@ class MotionDatabaseView extends ItemView {
       applyTransform();
     };
     const onMouseUp = () => {
-      if (dragging) { dragging = false; wrap.style.cursor = 'grab'; }
+      if (dragging) {
+        dragging = false;
+        wrap.classList.remove('is-panning');
+      }
     };
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
@@ -4324,7 +4327,7 @@ class MotionDatabaseView extends ItemView {
         renderStoredCell(td, c, val);
         // Click on non-PK cell to enter edit mode
         if (!c.pk && !c.ai) {
-          td.style.cursor = 'text';
+          td.classList.add('is-editable');
           td.onclick = () => { if (!editMode) enterEdit(); };
           td.tabIndex = 0;
           td.setAttribute('aria-label', `Edit ${c.name}`);
@@ -5388,14 +5391,8 @@ function renderQueryResults(containerEl, results, options = {}) {
 
   const wrap = containerEl.createDiv({ cls: 'mdb-query-table-wrap' });
   const table = wrap.createEl('table', {
-    cls: `mdb-query-table${options.interactive ? ' is-interactive' : ''}`,
+    cls: `mdb-query-table mdb-query-table-natural-width${options.interactive ? ' is-interactive' : ''}`,
   });
-  // Share available space when small, but preserve natural column widths
-  // when wider than the pane. Long prose wraps at the stylesheet's cell cap.
-  table.style.setProperty('display', 'table', 'important');
-  table.style.setProperty('width', 'max-content', 'important');
-  table.style.setProperty('min-width', '100%', 'important');
-  table.style.setProperty('max-width', 'none', 'important');
   const head = table.createEl('thead').createEl('tr');
   result.columns.forEach(column => {
     const format = getEmbedPropertyFormat(options.formats, column);
@@ -5830,8 +5827,6 @@ module.exports = class MotionDatabasePlugin extends Plugin {
   }
 
   async onunload() {
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE);
-    this.app.workspace.detachLeavesOfType(VIEW_TYPE_HOME);
     await Promise.all([...this.databases.values()].map(db => db.flushSave().catch(error => {
       console.error('[MotionDB] Failed to flush database during unload:', db.filePath, error);
     })));
