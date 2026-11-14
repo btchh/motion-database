@@ -663,8 +663,8 @@
 }
 
 /* Row states */
-.mdb-tr-editing {
-  background: var(--background-modifier-form-field) !important;
+.mdb-root .mdb-tr-editing {
+  background: var(--background-modifier-form-field);
 }
 .mdb-tr-editing .mdb-td {
   padding: 3px 4px;
@@ -675,8 +675,8 @@
   background: transparent;
   border-top: 2px dashed var(--background-modifier-border);
 }
-.mdb-tr-insert:hover {
-  background: color-mix(in srgb, var(--interactive-accent) 4%, transparent) !important;
+.mdb-root .mdb-tr-insert:hover {
+  background: color-mix(in srgb, var(--interactive-accent) 4%, transparent);
 }
 .mdb-tr-insert .mdb-td {
   padding: 3px 4px;
@@ -1053,7 +1053,7 @@
   display: grid;
   grid-template-columns: auto 1fr;
   grid-template-areas: "icon value" "icon label";
-  column-gap: var(--size-4-3);
+  gap: 0 var(--size-4-3);
   align-items: center;
   position: relative;
   overflow: hidden;
@@ -1175,26 +1175,26 @@
 .mdb-cheat-table {
   font-size: var(--font-ui-small);
 }
-.mdb-cheat-code {
+.mdb-root .mdb-cheat-code {
   font-family: var(--font-monospace, monospace);
-  padding: 5px 12px !important;
+  padding: 5px 12px;
   background: var(--background-primary);
   max-width: 520px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.mdb-cheat-code:hover {
-  background: var(--background-secondary-alt, var(--background-modifier-hover)) !important;
+.mdb-root .mdb-cheat-code:hover {
+  background: var(--background-secondary-alt, var(--background-modifier-hover));
 }
 .mdb-cheat-code code {
   font-family: inherit;
   font-size: var(--font-ui-small);
   color: var(--text-accent, var(--interactive-accent));
 }
-.mdb-cheat-desc {
+.mdb-root .mdb-cheat-desc {
   color: var(--text-muted);
-  padding: 5px 12px !important;
+  padding: 5px 12px;
 }
 
 /* ── Database home ─────────────────────────────────────────────────────────── */
@@ -1844,11 +1844,11 @@
   border: 0;
   border-radius: 0;
 }
-.mdb-query-table {
-  display: table !important;
-  width: 100% !important;
-  min-width: 100% !important;
-  max-width: none !important;
+.mdb-root table.mdb-query-table {
+  display: table;
+  width: 100%;
+  min-width: 100%;
+  max-width: none;
   border-collapse: collapse;
   table-layout: auto;
   font-size: var(--font-ui-small);
@@ -2633,8 +2633,7 @@
   grid-template-columns: minmax(150px, 0.45fr) minmax(220px, 1fr) auto;
   grid-template-areas: "title columns actions" "meta columns actions";
   align-items: center;
-  column-gap: var(--size-4-5);
-  row-gap: var(--size-2-1);
+  gap: var(--size-2-1) var(--size-4-5);
   padding: var(--size-4-3) var(--size-4-2);
   border: 0;
   border-bottom: 1px solid var(--background-modifier-border);
@@ -2748,8 +2747,8 @@
   border-top: 1px solid var(--background-modifier-border);
   background: var(--background-secondary);
 }
-.mdb-tr-insert:hover {
-  background: var(--background-modifier-hover) !important;
+.mdb-root .mdb-tr-insert:hover {
+  background: var(--background-modifier-hover);
 }
 .mdb-cell-locked {
   padding: 0;
@@ -2874,11 +2873,11 @@
   border: 0;
   background: transparent;
 }
-.mdb-cheat-code {
-  padding: var(--size-4-2) var(--size-4-3) !important;
+.mdb-root .mdb-cheat-code {
+  padding: var(--size-4-2) var(--size-4-3);
 }
-.mdb-cheat-desc {
-  padding: var(--size-4-2) var(--size-4-3) !important;
+.mdb-root .mdb-cheat-desc {
+  padding: var(--size-4-2) var(--size-4-3);
 }
 .mdb-erd-wrap {
   background-color: var(--background-primary);
@@ -3148,7 +3147,7 @@
   scrollbar-gutter: stable;
 }
 .mdb-modal .setting-item:not(.mdb-modal-actions) {
-  border-top: 0 !important;
+  border-top: 0;
 }
 .mdb-modal-actions {
   position: static;
@@ -3359,11 +3358,11 @@
   background: var(--background-primary);
   scrollbar-gutter: stable;
 }
-.block-language-motiondb .mdb-query-table {
-  display: table !important;
-  width: 100% !important;
-  min-width: 100% !important;
-  max-width: none !important;
+.block-language-motiondb table.mdb-query-table {
+  display: table;
+  width: 100%;
+  min-width: 100%;
+  max-width: none;
   margin: 0;
   border: 0;
   border-spacing: 0;
@@ -3783,10 +3782,10 @@ body .block-language-motiondb .mdb-query-table th.mdb-query-action-cell { z-inde
 
 /* Let an overflowing embed use natural column widths. Cell caps still wrap
  * long prose; short labels and values need not collapse toward a shared floor. */
-.block-language-motiondb .mdb-query-table { width:max-content !important; }
+.block-language-motiondb table.mdb-query-table.mdb-query-table-natural-width { width:max-content; }
 
 /* Query output keeps its natural column widths and grows to the available pane width. */
-.mdb-query-table.mdb-query-table-natural-width { width:max-content !important; }
+.mdb-root table.mdb-query-table.mdb-query-table-natural-width { width:max-content; }
 
 /* Keep the trash glyph readable independently of the button's hit area. */
 body :is(.mdb-del-btn,.mdb-query-delete-button) { --icon-size:18px; }

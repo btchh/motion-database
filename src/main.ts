@@ -2,13 +2,26 @@
 // Runtime behavior is covered by tests; new modules should not use this marker.
 // @ts-nocheck
 
+import {
+  activeDocument,
+  BasesView,
+  createEl,
+  createDiv,
+  createSpan,
+  ItemView,
+  MarkdownRenderChild,
+  Modal,
+  Notice,
+  Plugin,
+  setIcon,
+  Setting,
+} from 'obsidian';
+
 // ── Motion Database Engine ────────────────────────────────────────────────────
 // A self-contained relational DB engine in pure JS.
 // Supports: CREATE/DROP/ALTER TABLE, INSERT, SELECT (with JOIN, WHERE, ORDER BY,
 //           GROUP BY, LIMIT, OFFSET, aggregates), UPDATE, DELETE, TRUNCATE,
 //           PRIMARY KEY AUTOINCREMENT, FOREIGN KEY, NOT NULL, UNIQUE, DEFAULT.
-
-'use strict';
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
 
@@ -1356,7 +1369,7 @@ class MotionDBEngine {
     if (stmt.distinct) {
       const seen = new Set();
       rows = rows.filter(r => {
-        const k = Object.values(r).map(v => v === null ? '\x01' : String(v)).join('\x00');
+        const k = Object.values(r).map(v => v === null ? '\x01' : toDisplayString(v)).join('\x00');
         if (seen.has(k)) return false; seen.add(k); return true;
       });
     }
@@ -2149,6 +2162,19 @@ class MotionDBEngine {
   deserialize(s) { this.schema = JSON.parse(s); }
 }
 
+function toDisplayString(value: unknown, nullishAsEmpty = false): string {
+  if (value === null) return nullishAsEmpty ? '' : 'null';
+  if (value === undefined) return nullishAsEmpty ? '' : 'undefined';
+  if (Array.isArray(value)) return value.join(',');
+  if (value instanceof Date) return value.toString();
+  if (typeof value === 'object') return Object.prototype.toString.call(value);
+  if (typeof value === 'function') return Function.prototype.toString.call(value);
+  if (typeof value === 'symbol') return Symbol.prototype.toString.call(value);
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  return 'undefined';
+}
+
 function toSqlLiteral(value) {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
@@ -2388,8 +2414,6 @@ function computeERDLayout(tables, getTable, options = {}) {
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
-const { Plugin, ItemView, MarkdownRenderChild, Modal, Setting, Notice, setIcon } = require('obsidian');
-
 const VIEW_TYPE = 'motion-database';
 const VIEW_TYPE_HOME = 'motion-database-home';
 const DB_DIR = 'motion-databases';
@@ -2445,7 +2469,7 @@ class MotionDB {
         return; // success
       } catch (e) {
         lastErr = e;
-        if (attempt < 2) await new Promise(r => setTimeout(r, 60 * (attempt + 1)));
+        if (attempt < 2) await new Promise(r => window.setTimeout(r, 60 * (attempt + 1)));
       }
     }
 
@@ -2468,10 +2492,12 @@ class MotionDB {
         try {
           const raw = await this.plugin.app.vault.adapter.read(this.filePath);
           await this.plugin.app.vault.adapter.write(`${this.filePath}.corrupted-${Date.now()}.bak`, raw);
-        } catch { }
+        } catch (backupError) {
+          console.error('[MotionDB] Could not back up unreadable database:', this.filePath, backupError);
+        }
       }
-      console.error('[MotionDB] Database could not be loaded — backed up without overwriting:', this.filePath, lastErr);
-      throw new Error(`Database “${this.name}” could not be read. The original file was preserved and a backup was created.`);
+      console.error('[MotionDB] Database could not be loaded — the original was not overwritten:', this.filePath, lastErr);
+      throw new Error(`Database “${this.name}” could not be read. The original file was preserved and a backup was attempted.`);
     }
   }
 
@@ -2484,7 +2510,9 @@ class MotionDB {
       name: this.name,
       schema: this.engine.schema,
     }, null, 2);
-    const operation = this._saveChain.catch(() => { }).then(async () => {
+    const operation = this._saveChain.catch(error => {
+      console.warn('[MotionDB] Continuing save queue after a previous save failed:', this.filePath, error);
+    }).then(async () => {
       const vault = this.plugin.app.vault;
       const adapter = vault.adapter;
       const dir = this.filePath.substring(0, this.filePath.lastIndexOf('/'));
@@ -2501,7 +2529,11 @@ class MotionDB {
         await adapter.rename(tempPath, this.filePath);
       } catch {
         await adapter.write(this.filePath, payload);
-        try { if (await adapter.exists(tempPath)) await adapter.remove(tempPath); } catch { }
+        try {
+          if (await adapter.exists(tempPath)) await adapter.remove(tempPath);
+        } catch (cleanupError) {
+          console.warn('[MotionDB] Could not remove temporary save file:', tempPath, cleanupError);
+        }
       }
 
       if (window._motionDBRegistry) window._motionDBRegistry[this.name] = this;
@@ -2516,15 +2548,15 @@ class MotionDB {
 
   scheduleSave(delay = 90) {
     if (this._deleted || this.engine._inTx || !this.engine._dirty) return;
-    if (this._saveTimer) clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(() => {
+    if (this._saveTimer) window.clearTimeout(this._saveTimer);
+    this._saveTimer = window.setTimeout(() => {
       this._saveTimer = null;
       void this.flushSave().catch(error => console.error('[MotionDB] Background save failed:', this.filePath, error));
     }, delay);
   }
 
   async flushSave() {
-    if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null; }
+    if (this._saveTimer) { window.clearTimeout(this._saveTimer); this._saveTimer = null; }
     if (this._deleted || this.engine._inTx || !this.engine._dirty) return this._saveChain;
     this.engine._dirty = false;
     try {
@@ -2539,7 +2571,7 @@ class MotionDB {
   }
 
   cancelScheduledSave() {
-    if (this._saveTimer) clearTimeout(this._saveTimer);
+    if (this._saveTimer) window.clearTimeout(this._saveTimer);
     this._saveTimer = null;
   }
 
@@ -2799,10 +2831,17 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
           const guessDb = await plugin.getDatabase(guessPath);
           if (guessDb.name === name) { window._motionDBRegistry[name] = guessDb; return guessDb; }
         }
-      } catch { }
+      } catch (error) {
+        console.warn('[MotionDB] Fast database lookup failed; trying a full scan:', name, error);
+      }
 
       let files = [];
-      try { const d = await plugin.app.vault.adapter.list(DB_DIR); files = (d.files || []).filter(f => f.endsWith('.motiondb.json')); } catch { }
+      try {
+        const d = await plugin.app.vault.adapter.list(DB_DIR);
+        files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
+      } catch (error) {
+        console.error('[MotionDB] Could not list database files:', error);
+      }
       let byFilename = null;
       for (const fp of files) {
         if (fp === guessPath) continue; // already tried above
@@ -2870,7 +2909,13 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
      */
     list: async () => {
       let files = [];
-      try { const d = await plugin.app.vault.adapter.list(DB_DIR); files = (d.files || []).filter(f => f.endsWith('.motiondb.json')); } catch { }
+      try {
+        const d = await plugin.app.vault.adapter.list(DB_DIR);
+        files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
+      } catch (error) {
+        console.error('[MotionDB] Could not list databases:', error);
+        return [];
+      }
       const out = [];
       for (const fp of files) {
         const db = await plugin.getDatabase(fp);
@@ -2989,12 +3034,15 @@ class MotionDatabaseView extends ItemView {
   _scheduleSave() {
     if (this.db?.engine?._inTx) return;
     if (!this.db?.engine?._dirty) return;        // nothing changed — skip
-    if (this._saveTimer) clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(async () => {
+    if (this._saveTimer) window.clearTimeout(this._saveTimer);
+    this._saveTimer = window.setTimeout(() => {
       this._saveTimer = null;
       if (this.db && this.db.engine._dirty) {
-        await this.db.save();
-        this.db.engine._dirty = false;
+        void this.db.save().then(() => {
+          if (this.db) this.db.engine._dirty = false;
+        }).catch(error => {
+          console.error('[MotionDB] Debounced save failed:', this.db?.filePath, error);
+        });
       }
     }, 1000); // 1 s debounce — coalesces rapid writes without feeling sluggish
   }
@@ -3025,7 +3073,7 @@ class MotionDatabaseView extends ItemView {
     const headerIcon = workspaceHeader.createDiv({ cls: 'mdb-home-logo mdb-workspace-logo' });
     setIcon(headerIcon, 'database');
     const headerIdentity = workspaceHeader.createDiv({ cls: 'mdb-home-title-wrap' });
-    const titleEl = headerIdentity.createEl('span', { cls: 'mdb-home-title mdb-workspace-title', text: this.db.name });
+    const titleEl = headerIdentity.createSpan({ cls: 'mdb-home-title mdb-workspace-title', text: this.db.name });
     headerIdentity.createDiv({ cls: 'mdb-home-subtitle', text: 'Local database' });
     const savedState = workspaceHeader.createDiv({ cls: 'mdb-workspace-status' });
     setIcon(savedState, 'hard-drive');
@@ -3064,9 +3112,9 @@ class MotionDatabaseView extends ItemView {
         this.activeTab = id;
         this.render();
       });
-      const iconEl = el.createEl('span', { cls: 'mdb-nav-icon' });
+      const iconEl = el.createSpan({ cls: 'mdb-nav-icon' });
       setIcon(iconEl, icon);
-      el.createEl('span', { cls: 'mdb-nav-label', text: label });
+      el.createSpan({ cls: 'mdb-nav-label', text: label });
       return el;
     };
 
@@ -3108,7 +3156,7 @@ class MotionDatabaseView extends ItemView {
     const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    const a = createEl('a');
     a.href = url; a.download = `${tableName}.csv`; a.click();
     URL.revokeObjectURL(url);
     new Notice(`Exported ${tbl.rows.length} rows to ${tableName}.csv`);
@@ -3128,7 +3176,7 @@ class MotionDatabaseView extends ItemView {
 
   // ── Smart CSV import — creates table automatically if needed ───────────────
   importCSV(tableName = null) {
-    const input = document.createElement('input');
+    const input = createEl('input');
     input.type = 'file'; input.accept = '.csv';
     input.onchange = async (e) => {
       const file = e.target.files[0];
@@ -3313,7 +3361,7 @@ class MotionDatabaseView extends ItemView {
         if (vdef.sql) {
           defCell.createEl('code', { text: vdef.sql.length > 120 ? vdef.sql.slice(0, 120) + '…' : vdef.sql, cls: 'mdb-null' });
         } else {
-          defCell.createEl('span', { text: 'SELECT …', cls: 'mdb-null' });
+          defCell.createSpan({ text: 'SELECT …', cls: 'mdb-null' });
         }
       });
     }
@@ -3350,13 +3398,13 @@ class MotionDatabaseView extends ItemView {
     // ── Canvas container ──
     const wrap = el.createDiv({ cls: 'mdb-erd-wrap' });
 
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const svg = el.createSvg('svg');
     svg.classList.add('mdb-erd-svg');
     wrap.appendChild(svg);
 
     const ns = 'http://www.w3.org/2000/svg';
     const mk = (tag, attrs = {}) => {
-      const el = document.createElementNS(ns, tag);
+      const el = activeDocument.createElementNS(ns, tag);
       Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
       return el;
     };
@@ -3426,9 +3474,9 @@ class MotionDatabaseView extends ItemView {
       }
     });
     // Wait one microtask so wrap is guaranteed to be in the DOM before we start observing
-    Promise.resolve().then(() => {
+    void Promise.resolve().then(() => {
       if (wrap.parentNode) cleanup.observe(wrap.parentNode, { childList: true });
-    });
+    }).catch(error => console.error('[MotionDB] Could not observe ERD cleanup:', error));
 
     // ── Touch drag (pan) ──
     let lastTouchX = 0, lastTouchY = 0;
@@ -3624,7 +3672,7 @@ class MotionDatabaseView extends ItemView {
     });
 
     // Fit on next frame (after layout is available)
-    requestAnimationFrame(() => fitToView());
+    window.requestAnimationFrame(() => fitToView());
   }
 
   // ── Cheatsheet ──────────────────────────────────────────────────────────────
@@ -3811,7 +3859,7 @@ class MotionDatabaseView extends ItemView {
     sections.forEach(section => {
       const s = el.createDiv({ cls: 'mdb-cheat-section' });
       const sh = s.createDiv({ cls: 'mdb-cheat-section-hdr' });
-      sh.createEl('span', { text: section.title, cls: 'mdb-cheat-section-title' });
+      sh.createSpan({ text: section.title, cls: 'mdb-cheat-section-title' });
 
       const tbl = s.createEl('table', { cls: 'mdb-result-table mdb-cheat-table' });
       const tbody = tbl.createEl('tbody');
@@ -3860,9 +3908,9 @@ class MotionDatabaseView extends ItemView {
       const tbl = this.db.tableData(t);
       const card = grid.createDiv({ cls: 'mdb-table-card' });
       const ch = card.createDiv({ cls: 'mdb-table-card-hdr' });
-      const cardIcon = ch.createEl('span', { cls: 'mdb-table-card-icon' });
+      const cardIcon = ch.createSpan({ cls: 'mdb-table-card-icon' });
       setIcon(cardIcon, 'table-2');
-      ch.createEl('span', { cls: 'mdb-table-card-name', text: t });
+      ch.createSpan({ cls: 'mdb-table-card-name', text: t });
       ch.createSpan({
         cls: 'mdb-table-card-count',
         text: `${tbl.rows.length} ${tbl.rows.length === 1 ? 'row' : 'rows'}`,
@@ -3895,7 +3943,7 @@ class MotionDatabaseView extends ItemView {
     const hdr = el.createDiv({ cls: 'mdb-content-hdr' });
     const titleWrap = hdr.createDiv({ cls: 'mdb-sql-title-wrap' });
     titleWrap.createEl('h2', { cls: 'mdb-content-title', text: 'SQL' });
-    titleWrap.createEl('span', { cls: 'mdb-sql-prompt-db', text: this.db.name });
+    titleWrap.createSpan({ cls: 'mdb-sql-prompt-db', text: this.db.name });
 
     // Editor
     const textarea = el.createEl('textarea', { cls: 'mdb-sql-editor' });
@@ -4040,7 +4088,7 @@ class MotionDatabaseView extends ItemView {
   }
 
   _renderOutputBlock(container, block, append = false) {
-    const wrap = document.createElement('div');
+    const wrap = createDiv();
     wrap.className = 'mdb-sql-result';
 
     const result = block.result || block;
@@ -4048,24 +4096,26 @@ class MotionDatabaseView extends ItemView {
 
     // SQL echo header
     if (block.sql) {
-      const echo = document.createElement('div');
+      const echo = createDiv();
       echo.className = 'mdb-sql-echo';
-      const sqlSpan = document.createElement('code');
+      const sqlSpan = createEl('code');
       sqlSpan.className = 'mdb-sql-echo-text';
       sqlSpan.textContent = block.sql.length > 140 ? block.sql.slice(0, 140) + '…' : block.sql;
       echo.appendChild(sqlSpan);
-      const meta = document.createElement('span');
+      const meta = createSpan();
       meta.className = 'mdb-sql-echo-meta';
       meta.textContent = [block.timestamp, block.elapsed != null ? `${block.elapsed}ms` : null].filter(Boolean).join(' · ');
       echo.appendChild(meta);
-      const copyBtn = document.createElement('button');
+      const copyBtn = createEl('button');
       copyBtn.className = 'mdb-echo-copy-btn';
       copyBtn.title = 'Copy SQL';
       setIcon(copyBtn, 'copy');
       copyBtn.onclick = () => {
-        navigator.clipboard?.writeText(block.sql);
+        void navigator.clipboard?.writeText(block.sql).catch(error => {
+          console.warn('[MotionDB] Could not copy SQL to clipboard:', error);
+        });
         setIcon(copyBtn, 'check');
-        setTimeout(() => setIcon(copyBtn, 'copy'), 1200);
+        window.setTimeout(() => setIcon(copyBtn, 'copy'), 1200);
       };
       echo.appendChild(copyBtn);
       wrap.appendChild(echo);
@@ -4073,40 +4123,40 @@ class MotionDatabaseView extends ItemView {
 
     // Result body
     if (isError) {
-      const errEl = document.createElement('div');
+      const errEl = createDiv();
       errEl.className = 'mdb-sql-error';
       errEl.setAttribute('role', 'alert');
-      const icon = document.createElement('span'); icon.className = 'mdb-error-icon'; setIcon(icon, 'alert-circle');
-      const errorCopy = document.createElement('div'); errorCopy.className = 'mdb-feedback-copy';
-      const errorTitle = document.createElement('strong'); errorTitle.className = 'mdb-feedback-title'; errorTitle.textContent = 'Query failed';
-      const msg = document.createElement('div'); msg.className = 'mdb-error-msg'; msg.textContent = block.message || result.message || 'The query could not be completed.';
+      const icon = createSpan(); icon.className = 'mdb-error-icon'; setIcon(icon, 'alert-circle');
+      const errorCopy = createDiv(); errorCopy.className = 'mdb-feedback-copy';
+      const errorTitle = createEl('strong'); errorTitle.className = 'mdb-feedback-title'; errorTitle.textContent = 'Query failed';
+      const msg = createDiv(); msg.className = 'mdb-error-msg'; msg.textContent = block.message || result.message || 'The query could not be completed.';
       errorCopy.appendChild(errorTitle); errorCopy.appendChild(msg);
       errEl.appendChild(icon); errEl.appendChild(errorCopy);
       wrap.appendChild(errEl);
 
     } else if (result.type === 'ok') {
-      const okEl = document.createElement('div');
+      const okEl = createDiv();
       okEl.className = 'mdb-sql-ok';
       okEl.setAttribute('role', 'status');
-      const icon = document.createElement('span'); icon.className = 'mdb-ok-icon'; setIcon(icon, 'check');
-      const successCopy = document.createElement('div'); successCopy.className = 'mdb-feedback-copy';
-      const successTitle = document.createElement('strong'); successTitle.className = 'mdb-feedback-title'; successTitle.textContent = 'Query complete';
-      const msgEl = document.createElement('div'); msgEl.className = 'mdb-ok-msg'; msgEl.textContent = result.message || 'The query completed successfully.';
-      const elapsed = document.createElement('span'); elapsed.className = 'mdb-sql-elapsed'; elapsed.textContent = block.elapsed != null ? `${block.elapsed}ms` : '';
+      const icon = createSpan(); icon.className = 'mdb-ok-icon'; setIcon(icon, 'check');
+      const successCopy = createDiv(); successCopy.className = 'mdb-feedback-copy';
+      const successTitle = createEl('strong'); successTitle.className = 'mdb-feedback-title'; successTitle.textContent = 'Query complete';
+      const msgEl = createDiv(); msgEl.className = 'mdb-ok-msg'; msgEl.textContent = result.message || 'The query completed successfully.';
+      const elapsed = createSpan(); elapsed.className = 'mdb-sql-elapsed'; elapsed.textContent = block.elapsed != null ? `${block.elapsed}ms` : '';
       successCopy.appendChild(successTitle); successCopy.appendChild(msgEl);
       okEl.appendChild(icon); okEl.appendChild(successCopy); okEl.appendChild(elapsed);
       wrap.appendChild(okEl);
 
     } else if (result.type === 'rows') {
       const rowCount = result.rows.length;
-      const meta = document.createElement('div');
+      const meta = createDiv();
       meta.className = 'mdb-result-meta';
-      const countEl = document.createElement('span');
+      const countEl = createSpan();
       countEl.className = 'mdb-result-count';
       countEl.textContent = rowCount === 0 ? 'Empty set (0 rows)' : `${rowCount} row${rowCount !== 1 ? 's' : ''}`;
       meta.appendChild(countEl);
       if (block.elapsed != null && block.sql) {
-        const elapsedEl = document.createElement('span');
+        const elapsedEl = createSpan();
         elapsedEl.className = 'mdb-sql-elapsed';
         elapsedEl.textContent = `${block.elapsed}ms`;
         meta.appendChild(elapsedEl);
@@ -4114,21 +4164,21 @@ class MotionDatabaseView extends ItemView {
       wrap.appendChild(meta);
 
       if (rowCount > 0) {
-        const tableWrap = document.createElement('div');
+        const tableWrap = createDiv();
         tableWrap.className = 'mdb-result-table-wrap';
-        const table = document.createElement('table');
+        const table = createEl('table');
         table.className = 'mdb-result-table';
         const thead = table.createTHead().insertRow();
-        result.columns.forEach(c => { const th = document.createElement('th'); th.textContent = String(c); thead.appendChild(th); });
+        result.columns.forEach(c => { const th = createEl('th'); th.textContent = String(c); thead.appendChild(th); });
         const tbody = table.createTBody();
         result.rows.forEach(row => {
           const tr = tbody.insertRow();
           row.forEach(val => {
             const td = tr.insertCell();
             if (val === null || val === undefined) {
-              const span = document.createElement('span'); span.className = 'mdb-null'; span.textContent = 'NULL'; td.appendChild(span);
+              const span = createSpan(); span.className = 'mdb-null'; span.textContent = 'NULL'; td.appendChild(span);
             } else if (typeof val === 'boolean') {
-              const span = document.createElement('span'); span.className = val ? 'mdb-bool-true' : 'mdb-bool-false'; span.textContent = val ? 'TRUE' : 'FALSE'; td.appendChild(span);
+              const span = createSpan(); span.className = val ? 'mdb-bool-true' : 'mdb-bool-false'; span.textContent = val ? 'TRUE' : 'FALSE'; td.appendChild(span);
             } else { td.textContent = String(val); }
           });
         });
@@ -4168,7 +4218,12 @@ class MotionDatabaseView extends ItemView {
 
   async getDBFiles() {
     let files = [];
-    try { const d = await this.plugin.app.vault.adapter.list(DB_DIR); files = (d.files || []).filter(f => f.endsWith('.motiondb.json')); } catch { }
+    try {
+      const d = await this.plugin.app.vault.adapter.list(DB_DIR);
+      files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
+    } catch (error) {
+      console.error('[MotionDB] Could not list database files:', error);
+    }
     return files;
   }
 
@@ -4184,7 +4239,7 @@ class MotionDatabaseView extends ItemView {
     const tableTitleIcon = tableTitle.createSpan({ cls: 'mdb-title-icon' });
     setIcon(tableTitleIcon, 'table-2');
     tableTitle.createEl('h2', { cls: 'mdb-content-title', text: tableName });
-    const metaEl = hdr.createEl('span', { cls: 'mdb-table-meta', text: `${tbl.columns.length} columns · ${tbl.rows.length} rows` });
+    const metaEl = hdr.createSpan({ cls: 'mdb-table-meta', text: `${tbl.columns.length} columns · ${tbl.rows.length} rows` });
 
     const actions = hdr.createDiv({ cls: 'mdb-hdr-actions' });
     const structBtn = actions.createEl('button', { cls: 'mdb-btn' });
@@ -4203,15 +4258,15 @@ class MotionDatabaseView extends ItemView {
     // Column strip
     const colRow = el.createDiv({ cls: 'mdb-col-strip' });
     tbl.columns.forEach(c => {
-      const badge = colRow.createEl('span', { cls: 'mdb-col-badge' });
-      badge.createEl('span', { cls: 'mdb-col-badge-type', text: c.type });
-      badge.createEl('span', { cls: 'mdb-col-badge-name', text: c.name });
+      const badge = colRow.createSpan({ cls: 'mdb-col-badge' });
+      badge.createSpan({ cls: 'mdb-col-badge-type', text: c.type });
+      badge.createSpan({ cls: 'mdb-col-badge-name', text: c.name });
       const presentation = storedColumnPropertyFormat(c);
-      if (presentation) badge.createEl('span', { cls: 'mdb-col-key mdb-presentation-key', text: presentation.type === 'rating' ? presentation.style : presentation.type });
-      if (c.pk) badge.createEl('span', { cls: 'mdb-col-key mdb-pk', text: 'PK' });
-      if (c.fk) badge.createEl('span', { cls: 'mdb-col-key mdb-fk', text: `FK→${c.fk.table}` });
-      if (c.ai) badge.createEl('span', { cls: 'mdb-col-key mdb-ai', text: 'AI' });
-      if (c.notNull && !c.pk) badge.createEl('span', { cls: 'mdb-col-key mdb-nn', text: 'NN' });
+      if (presentation) badge.createSpan({ cls: 'mdb-col-key mdb-presentation-key', text: presentation.type === 'rating' ? presentation.style : presentation.type });
+      if (c.pk) badge.createSpan({ cls: 'mdb-col-key mdb-pk', text: 'PK' });
+      if (c.fk) badge.createSpan({ cls: 'mdb-col-key mdb-fk', text: `FK→${c.fk.table}` });
+      if (c.ai) badge.createSpan({ cls: 'mdb-col-key mdb-ai', text: 'AI' });
+      if (c.notNull && !c.pk) badge.createSpan({ cls: 'mdb-col-key mdb-nn', text: 'NN' });
     });
 
     const wrap = el.createDiv({ cls: 'mdb-table-wrap' });
@@ -4223,10 +4278,10 @@ class MotionDatabaseView extends ItemView {
     tbl.columns.forEach(c => {
       const th = thead.createEl('th', { cls: 'mdb-th' });
       const inner = th.createDiv({ cls: 'mdb-th-inner' });
-      inner.createEl('span', { cls: 'mdb-th-name', text: c.name });
+      inner.createSpan({ cls: 'mdb-th-name', text: c.name });
       const presentation = storedColumnPropertyFormat(c);
-      inner.createEl('span', { cls: 'mdb-th-type', text: presentation ? `${c.type} · ${presentation.type === 'rating' ? presentation.style : presentation.type}` : c.type });
-      if (c.pk) inner.createEl('span', { cls: 'mdb-col-key mdb-pk', text: 'PK' });
+      inner.createSpan({ cls: 'mdb-th-type', text: presentation ? `${c.type} · ${presentation.type === 'rating' ? presentation.style : presentation.type}` : c.type });
+      if (c.pk) inner.createSpan({ cls: 'mdb-col-key mdb-pk', text: 'PK' });
     });
     thead.createEl('th', { cls: 'mdb-th mdb-th-act' });
 
@@ -4237,24 +4292,24 @@ class MotionDatabaseView extends ItemView {
       // FK column — show a datalist for autocomplete
       if (c.fk) {
         const refTbl = this.db.tableData(c.fk.table);
-        const inp = document.createElement('input');
+        const inp = createEl('input');
         inp.className = 'mdb-cell-input';
         inp.value = value !== null && value !== undefined ? String(value) : '';
         inp.placeholder = 'NULL';
         if (refTbl) {
           const dlId = `mdb-dl-${tableName}-${c.name}`;
-          let dl = document.getElementById(dlId);
+          let dl = activeDocument.getElementById(dlId);
           if (!dl) {
-            dl = document.createElement('datalist');
+            dl = createEl('datalist');
             dl.id = dlId;
             refTbl.rows.forEach(r => {
-              const opt = document.createElement('option');
+              const opt = createEl('option');
               opt.value = String(r[c.fk.col] ?? '');
-              const label = Object.values(r).slice(0, 3).join(' · ');
+              const label = Object.values(r).slice(0, 3).map(value => toDisplayString(value, true)).join(' · ');
               opt.label = label;
               dl.appendChild(opt);
             });
-            document.body.appendChild(dl);
+            activeDocument.body.appendChild(dl);
           }
           inp.setAttribute('list', dlId);
         }
@@ -4264,7 +4319,7 @@ class MotionDatabaseView extends ItemView {
       // Boolean / INTEGER 0-1 — checkbox
       const presentation = storedColumnPropertyFormat(c);
       if (presentation?.type === 'checkbox' || (!c.presentation && c.type === 'INTEGER' && (c.name.startsWith('is_') || c.name.startsWith('has_')))) {
-        const inp = document.createElement('input');
+        const inp = createEl('input');
         inp.type = 'checkbox';
         inp.className = 'mdb-cell-check';
         inp.checked = !!value;
@@ -4272,7 +4327,7 @@ class MotionDatabaseView extends ItemView {
         return inp;
       }
       // Default — text input
-      const inp = document.createElement('input');
+      const inp = createEl('input');
       inp.className = 'mdb-cell-input';
       inp.value = value !== null && value !== undefined ? String(value) : '';
       inp.placeholder = c.notNull ? (c.default !== undefined ? String(c.default) : '') : 'NULL';
@@ -4291,7 +4346,7 @@ class MotionDatabaseView extends ItemView {
     const renderStoredCell = (td, column, value) => {
       td.empty();
       if (value === null || value === undefined) {
-        td.createEl('span', { cls: 'mdb-null', text: 'NULL' });
+        td.createSpan({ cls: 'mdb-null', text: 'NULL' });
         return;
       }
       const format = storedColumnPropertyFormat(column);
@@ -4318,7 +4373,7 @@ class MotionDatabaseView extends ItemView {
       const inputMap = {};
 
       const numTd = tr.createEl('td', { cls: 'mdb-td mdb-td-num' });
-      numTd.createEl('span', { cls: 'mdb-row-num', text: String(i + 1) });
+      numTd.createSpan({ cls: 'mdb-row-num', text: String(i + 1) });
 
       // Data cells — render as display or input depending on editMode
       const cellTds = tbl.columns.map(c => {
@@ -4353,7 +4408,7 @@ class MotionDatabaseView extends ItemView {
           td.empty();
           if (col.pk || col.ai) {
             // PK/AI — show value as locked badge
-            const lock = td.createEl('span', { cls: 'mdb-cell-locked', text: String(row[col.name] ?? '') });
+            td.createSpan({ cls: 'mdb-cell-locked', text: String(row[col.name] ?? '') });
           } else {
             const inp = buildInput(col, row[col.name], inputMap);
             td.appendChild(inp);
@@ -4376,9 +4431,15 @@ class MotionDatabaseView extends ItemView {
           .filter(Boolean);
         inputs.forEach((inp, idx) => {
           inp.onkeydown = e => {
-            if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              void saveEdit().catch(error => new Notice(`Could not save row: ${error.message}`));
+            }
             if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
-            if (e.key === 'Tab' && !e.shiftKey && idx === inputs.length - 1) { e.preventDefault(); saveEdit(); }
+            if (e.key === 'Tab' && !e.shiftKey && idx === inputs.length - 1) {
+              e.preventDefault();
+              void saveEdit().catch(error => new Notice(`Could not save row: ${error.message}`));
+            }
           };
         });
         if (inputs[0]) inputs[0].focus();
@@ -4459,17 +4520,16 @@ class MotionDatabaseView extends ItemView {
     const insertRow = tbody.createEl('tr', { cls: 'mdb-tr mdb-tr-insert' });
     const insertInputMap = {};
 
-    insertRow.createEl('td', { cls: 'mdb-td mdb-td-num' }).createEl('span', { cls: 'mdb-insert-icon', text: '+' });
+    insertRow.createEl('td', { cls: 'mdb-td mdb-td-num' }).createSpan({ cls: 'mdb-insert-icon', text: '+' });
 
-    const insertCells = tbl.columns.map(c => {
+    tbl.columns.forEach(c => {
       const td = insertRow.createEl('td', { cls: 'mdb-td' });
       if (c.ai) {
-        td.createEl('span', { cls: 'mdb-cell-locked', text: 'auto' });
+        td.createSpan({ cls: 'mdb-cell-locked', text: 'auto' });
       } else {
         const inp = buildInput(c, null, insertInputMap);
         td.appendChild(inp);
       }
-      return { td, col: c };
     });
 
     const insertActTd = insertRow.createEl('td', { cls: 'mdb-td mdb-td-act' });
@@ -4489,7 +4549,7 @@ class MotionDatabaseView extends ItemView {
         const newRow = tbl.rows[tbl.rows.length - 1];
         const newTr = renderDataRow(newRow, tbl.rows.length - 1, insertRow);
         newTr.addClass('mdb-tr-flash');
-        setTimeout(() => newTr.classList.remove('mdb-tr-flash'), 600);
+        window.setTimeout(() => newTr.classList.remove('mdb-tr-flash'), 600);
         // Reset insert inputs
         tbl.columns.filter(c => !c.ai).forEach(c => {
           const inp = insertInputMap[c.name];
@@ -4510,19 +4570,25 @@ class MotionDatabaseView extends ItemView {
     const insertInputs = tbl.columns.filter(c => !c.ai).map(c => insertInputMap[c.name]).filter(Boolean);
     insertInputs.forEach((inp, idx) => {
       inp.onkeydown = e => {
-        if (e.key === 'Enter') { e.preventDefault(); doInsert(true); }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          void doInsert(true).catch(error => new Notice(`Could not insert row: ${error.message}`));
+        }
         if (e.key === 'Escape') {
           e.preventDefault();
           tbl.columns.filter(c => !c.ai).forEach(c => { const i = insertInputMap[c.name]; if (i) { if (i.type === 'checkbox') i.checked = false; else i.value = ''; } });
         }
-        if (e.key === 'Tab' && !e.shiftKey && idx === insertInputs.length - 1) { e.preventDefault(); doInsert(true); }
+        if (e.key === 'Tab' && !e.shiftKey && idx === insertInputs.length - 1) {
+          e.preventDefault();
+          void doInsert(true).catch(error => new Notice(`Could not insert row: ${error.message}`));
+        }
       };
     });
   }
 
   async onClose() {
     if (this._saveTimer) {
-      clearTimeout(this._saveTimer);
+      window.clearTimeout(this._saveTimer);
       this._saveTimer = null;
     }
     if (this.db && !this.db._deleted && !this.db.engine._inTx && this.db.engine._dirty) {
@@ -4574,7 +4640,7 @@ class NewTableModal extends Modal {
       colsEl.empty();
       // Header
       const hdr = colsEl.createDiv({ cls: 'mdb-col-row mdb-col-row-hdr' });
-      ['Name', 'Type', 'Display', 'Max', 'PK', 'AI', 'NOT NULL', 'UNIQUE', 'Default', ''].forEach(h => hdr.createEl('span', { text: h, cls: 'mdb-col-hdr-cell' }));
+      ['Name', 'Type', 'Display', 'Max', 'PK', 'AI', 'NOT NULL', 'UNIQUE', 'Default', ''].forEach(h => hdr.createSpan({ text: h, cls: 'mdb-col-hdr-cell' }));
 
       cols.forEach((col, i) => {
         const row = colsEl.createDiv({ cls: 'mdb-col-row' });
@@ -4605,11 +4671,11 @@ class NewTableModal extends Modal {
         if (String(col.presentation).startsWith('rating-')) {
           const max = row.createEl('input', { cls: 'mdb-col-inp mdb-col-inp-max', type: 'number', value: String(col.ratingMax || 5), attr: { min: '1', max: '100', 'aria-label': `Rating maximum for ${col.name}` } });
           max.oninput = () => { cols[i].ratingMax = Math.max(1, Math.min(100, Math.round(Number(max.value) || 5))); };
-        } else row.createEl('span', { cls: 'mdb-col-max-spacer' });
+        } else row.createSpan({ cls: 'mdb-col-max-spacer' });
 
         const checkboxLabels = { pk: 'Primary key', ai: 'Auto increment', notNull: 'Not null', unique: 'Unique' };
         const mkCb = key => {
-          const checkbox = document.createElement('input');
+          const checkbox = createEl('input');
           checkbox.type = 'checkbox';
           checkbox.className = 'mdb-col-checkbox';
           checkbox.checked = Boolean(col[key]);
@@ -4640,7 +4706,7 @@ class NewTableModal extends Modal {
             updatePreview();
           };
         }
-        else row.createEl('span');
+        else row.createSpan();
       });
     };
     renderCols();
@@ -4680,104 +4746,6 @@ class NewTableModal extends Modal {
             if (draft) column.presentation = presentationFromChoice(draft.presentation, draft.ratingMax);
           });
           if (created) this.db.engine._dirty = true;
-          await this.onSave();
-          this.close();
-        } catch (e) { new Notice('Error: ' + e.message); }
-      }))
-      .addButton(b => b.setButtonText('Cancel').onClick(() => this.close()));
-    installModalFooter(contentEl, actions);
-  }
-  onClose() { this.contentEl.empty(); }
-}
-
-// ── Insert Row Modal ────────────────────────────────────────────────────────────
-
-class InsertRowModal extends Modal {
-  constructor(app, db, tableName, onSave) { super(app); this.db = db; this.tableName = tableName; this.onSave = onSave; }
-
-  onOpen() {
-    this.modalEl.addClass('mdb-modal');
-    this.setTitle(`Insert into ${this.tableName}`);
-    const { contentEl } = this;
-    const tbl = this.db.tableData(this.tableName);
-    const vals = {};
-
-    tbl.columns.filter(c => !c.ai).forEach(c => {
-      new Setting(contentEl)
-        .setName(c.name)
-        .setDesc(`${c.type}${c.notNull ? ' · NOT NULL' : ''}${c.pk ? ' · PK' : ''}${c.fk ? ` · FK → ${c.fk.table}(${c.fk.col})` : ''}`)
-        .addText(t => {
-          t.setPlaceholder(c.default !== undefined ? String(c.default) : 'NULL');
-          t.onChange(v => vals[c.name] = v);
-        });
-    });
-
-    const actions = new Setting(contentEl)
-      .addButton(b => b.setButtonText('Insert').setCta().onClick(async () => {
-        try {
-          const tblCols = tbl.columns.filter(c => !c.ai);
-          const cols = tblCols.map(c => c.name);
-          const values = tblCols.map(c => {
-            const v = vals[c.name];
-            if (v === undefined || v === '') return 'NULL';
-            if (c.type === 'INTEGER' || c.type === 'REAL') return isNaN(Number(v)) ? `'${v}'` : v;
-            return `'${v.replace(/'/g, "''")}'`;
-          });
-          this.db.exec(`INSERT INTO ${this.tableName} (${cols.join(', ')}) VALUES (${values.join(', ')})`);
-          await this.onSave();
-          this.close();
-        } catch (e) { new Notice('Error: ' + e.message); }
-      }))
-      .addButton(b => b.setButtonText('Cancel').onClick(() => this.close()));
-    installModalFooter(contentEl, actions);
-  }
-  onClose() { this.contentEl.empty(); }
-}
-
-// ── Edit Row Modal ─────────────────────────────────────────────────────────────
-
-class EditRowModal extends Modal {
-  constructor(app, db, tableName, row, onSave) { super(app); this.db = db; this.tableName = tableName; this.row = row; this.onSave = onSave; }
-
-  onOpen() {
-    this.modalEl.addClass('mdb-modal');
-    this.setTitle(`Edit row`);
-    const { contentEl } = this;
-    const tbl = this.db.tableData(this.tableName);
-    const vals = { ...this.row };
-
-    tbl.columns.forEach(c => {
-      const s = new Setting(contentEl)
-        .setName(c.name)
-        .setDesc(`${c.type}${c.pk ? ' · PK' : ''}${c.ai ? ' · AUTO_INCREMENT' : ''}`);
-      if (c.ai || c.pk) {
-        s.addText(t => { t.setValue(String(vals[c.name] ?? '')); t.setDisabled(true); });
-      } else {
-        s.addText(t => {
-          t.setValue(vals[c.name] !== null && vals[c.name] !== undefined ? String(vals[c.name]) : '');
-          t.onChange(v => vals[c.name] = v === '' ? null : v);
-        });
-      }
-    });
-
-    const actions = new Setting(contentEl)
-      .addButton(b => b.setButtonText('Save').setCta().onClick(async () => {
-        try {
-          const pkCol = tbl.columns.find(c => c.pk);
-          if (!pkCol) { new Notice('No primary key — cannot update.'); return; }
-          const sets = tbl.columns.filter(c => !c.pk && !c.ai).map(c => {
-            const v = vals[c.name];
-            if (v === null) return `${c.name} = NULL`;
-            const s = String(v);
-            if ((c.type === 'INTEGER' || c.type === 'REAL') && !isNaN(Number(s))) return `${c.name} = ${s}`;
-            return `${c.name} = '${s.replace(/'/g, "''")}'`;
-          }).join(', ');
-          const pkVal = this.row[pkCol.name];
-          const pkLit = (pkVal === null || pkVal === undefined)
-            ? 'NULL'
-            : (typeof pkVal === 'number' ? String(pkVal) : `'${String(pkVal).replace(/'/g, "''")}'`);
-          const where = `${pkCol.name} = ${pkLit}`;
-          this.db.exec(`UPDATE ${this.tableName} SET ${sets} WHERE ${where}`);
           await this.onSave();
           this.close();
         } catch (e) { new Notice('Error: ' + e.message); }
@@ -4903,7 +4871,7 @@ class ConfirmModal extends Modal {
     this.setTitle('Confirm action');
     this.contentEl.createEl('p', { cls: 'mdb-confirm-message', text: this.message });
     const actions = new Setting(this.contentEl)
-      .addButton(b => b.setButtonText('Confirm').setWarning().onClick(() => { this.onConfirm(); this.close(); }))
+      .addButton(b => b.setButtonText('Confirm').setDestructive().onClick(() => { this.onConfirm(); this.close(); }))
       .addButton(b => b.setButtonText('Cancel').onClick(() => { this.onCancel?.(); this.close(); }));
     installModalFooter(this.contentEl, actions);
   }
@@ -4947,7 +4915,11 @@ class MotionDatabaseHomeView extends ItemView {
     try {
       const d = await this.plugin.app.vault.adapter.list(DB_DIR);
       files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
-    } catch { }
+    } catch (error) {
+      console.error('[MotionDB] Could not load database list:', error);
+      root.createDiv({ cls: 'mdb-query-error', text: 'Could not load databases. Check the console for details.' });
+      return;
+    }
 
     // Load metadata for each db
     const databases = [];
@@ -4968,7 +4940,9 @@ class MotionDatabaseHomeView extends ItemView {
           views: viewCount,
           mtime: stat?.mtime || 0,
         });
-      } catch { }
+      } catch (error) {
+        console.warn('[MotionDB] Could not read database metadata:', fp, error);
+      }
     }
     databases.sort((a, b) => b.mtime - a.mtime);
 
@@ -5040,7 +5014,7 @@ class MotionDatabaseHomeView extends ItemView {
           const nameInput = nameWrap.createEl('input', { cls: 'mdb-db-rename-input' });
           nameInput.value = dbInfo.name;
           nameInput.type = 'text';
-          setTimeout(() => { nameInput.focus(); nameInput.select(); }, 30);
+          window.setTimeout(() => { nameInput.focus(); nameInput.select(); }, 30);
 
           let renameHandled = false;
           const doRename = async () => {
@@ -5075,7 +5049,10 @@ class MotionDatabaseHomeView extends ItemView {
           nameInput.onblur = doRename;
           nameInput.onkeydown = e => {
             if (e.key === 'Enter') { e.preventDefault(); nameInput.blur(); }
-            if (e.key === 'Escape') { this.renaming = null; this.render(); }
+            if (e.key === 'Escape') {
+              this.renaming = null;
+              void this.render().catch(error => console.error('[MotionDB] Could not refresh home view:', error));
+            }
           };
           nameWrap.createDiv({ cls: 'mdb-db-card-path', text: dbInfo.filePath.split('/').pop() });
         } else {
@@ -5201,7 +5178,11 @@ class MotionDatabaseHomeView extends ItemView {
     };
 
     createBtn.onclick = doCreate;
-    nameInput.onkeydown = e => { if (e.key === 'Enter' && !createBtn.disabled) doCreate(); };
+    nameInput.onkeydown = e => {
+      if (e.key === 'Enter' && !createBtn.disabled) {
+        void doCreate().catch(error => new Notice(`Could not create database: ${error.message}`));
+      }
+    };
   }
 
   onClose() { this.containerEl.empty(); }
@@ -5347,7 +5328,7 @@ function renderEmbedPropertyValue(td, value, format, options = {}) {
     if (format.type === 'image' || images.includes(media.extension)) {
       const image = td.createEl('img', { cls: 'mdb-property-image', attr: { src: media.src, alt: media.raw, loading: 'lazy' } });
       image.onerror = () => {
-        const missing = document.createElement('span');
+        const missing = createSpan();
         missing.className = 'mdb-property-missing';
         missing.textContent = media.raw;
         image.replaceWith(missing);
@@ -5709,7 +5690,6 @@ class MotionDatabaseEmbed extends MarkdownRenderChild {
 }
 
 function registerBasesIntegration(plugin) {
-  const BasesView = require('obsidian').BasesView;
   if (!BasesView || typeof plugin.registerBasesView !== 'function') return false;
 
   class MotionDatabaseBasesView extends BasesView {
@@ -5727,8 +5707,10 @@ function registerBasesIntegration(plugin) {
 
     async renderDatabaseQuery() {
       const version = ++this.renderVersion;
-      const database = String(this.config.get('database') || '').trim();
-      const sql = String(this.config.get('sql') || '').trim();
+    const databaseValue: unknown = this.config.get('database');
+    const sqlValue: unknown = this.config.get('sql');
+    const database = typeof databaseValue === 'string' ? databaseValue.trim() : '';
+    const sql = typeof sqlValue === 'string' ? sqlValue.trim() : '';
       this.containerEl.empty();
 
       if (!database || !sql) {
@@ -5780,7 +5762,7 @@ function registerBasesIntegration(plugin) {
 
 
 module.exports = class MotionDatabasePlugin extends Plugin {
-  async onload() {
+  onload() {
     this.databases = new Map();
     this.registerView(VIEW_TYPE, leaf => new MotionDatabaseView(leaf, this));
     this.registerView(VIEW_TYPE_HOME, leaf => new MotionDatabaseHomeView(leaf, this));
@@ -5818,7 +5800,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     // We use a short timeout because setState is async and may not have finished
     // by the time onLayoutReady fires.
     this.app.workspace.onLayoutReady(() => {
-      setTimeout(() => {
+      window.setTimeout(() => {
         this.app.workspace.getLeavesOfType(VIEW_TYPE).forEach(leaf => {
           if (!leaf.view?.db) leaf.detach();
         });
@@ -5826,13 +5808,16 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     });
   }
 
-  async onunload() {
-    await Promise.all([...this.databases.values()].map(db => db.flushSave().catch(error => {
+  onunload() {
+    const pendingSaves = [...this.databases.values()].map(db => db.flushSave().catch(error => {
       console.error('[MotionDB] Failed to flush database during unload:', db.filePath, error);
-    })));
+    }));
     delete window.motiondb;
     delete window._motionDBRegistry;
     this.databases.clear();
+    void Promise.all(pendingSaves).catch(error => {
+      console.error('[MotionDB] Unexpected error while flushing databases during unload:', error);
+    });
   }
 
   async getDatabase(filePath) {
@@ -5869,7 +5854,9 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     const db = this.databases.get(key);
     if (db) {
       db.cancelScheduledSave();
-      await db._saveChain.catch(() => { });
+      await db._saveChain.catch(error => {
+        console.warn('[MotionDB] Continuing database deletion after a failed save:', key, error);
+      });
       db._deleted = true;
     }
     if (await this.app.vault.adapter.exists(key)) {
@@ -5887,13 +5874,17 @@ module.exports = class MotionDatabasePlugin extends Plugin {
   async openHome() {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_HOME);
     if (existing.length > 0) {
-      this.app.workspace.revealLeaf(existing[0]);
-      try { if (existing[0].view?.render) await existing[0].view.render(); } catch (e) { }
+      await this.app.workspace.revealLeaf(existing[0]);
+      try {
+        if (existing[0].view?.render) await existing[0].view.render();
+      } catch (error) {
+        console.error('[MotionDB] Could not refresh the home view:', error);
+      }
       return;
     }
     const leaf = this.app.workspace.getLeaf('tab');
     await leaf.setViewState({ type: VIEW_TYPE_HOME, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    await this.app.workspace.revealLeaf(leaf);
   }
 
   async openInLeaf(filePath) {
@@ -5901,7 +5892,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     for (const leaf of existing) {
       if (leaf.view?.db?.filePath === filePath) {
-        this.app.workspace.revealLeaf(leaf);
+        await this.app.workspace.revealLeaf(leaf);
         return;
       }
     }
@@ -5911,7 +5902,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     if (!emptyLeaf) {
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
-    this.app.workspace.revealLeaf(leaf);
+    await this.app.workspace.revealLeaf(leaf);
     if (leaf.view?.loadDB) {
       await leaf.view.loadDB(filePath);
     }
