@@ -1,5 +1,5 @@
-# Motion Database 2.3.9
+# Motion Database 2.3.10
 
-- Clear now removes both the SQL editor text and its displayed results; unexpected run errors are shown in the terminal.
-- Add a visible Add row action that takes you to the row entry fields.
-- Preserve and focus the clicked cell when editing, support updates in tables without a primary key, and keep nonstandard date or rating values visible in the editor.
+- Fix table input creation that could throw a `HierarchyRequestError` when opening a table or entering edit mode.
+- Create SQL result elements inside their output container so running or restoring queries does not append elements to the document root.
+- Create temporary CSV controls and foreign-key autocomplete elements under valid DOM parents.

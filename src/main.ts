@@ -3596,8 +3596,9 @@ class MotionDatabaseView extends ItemView {
     const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
-    const a = document.createEl('a');
+    const a = document.body.createEl('a');
     a.href = url; a.download = `${tableName}.csv`; a.click();
+    a.remove();
     URL.revokeObjectURL(url);
     new Notice(`Exported ${tbl.rows.length} rows to ${tableName}.csv`);
   }
@@ -3616,10 +3617,11 @@ class MotionDatabaseView extends ItemView {
 
   // ── Smart CSV import — creates table automatically if needed ───────────────
   importCSV(tableName: string | null = null): void {
-    const input = document.createEl('input');
+    const input = document.body.createEl('input');
     input.type = 'file'; input.accept = '.csv';
     input.onchange = async () => {
       const file = input.files?.[0];
+      input.remove();
       if (!file) return;
       const db = this.db;
       if (!db) return;
@@ -4578,98 +4580,76 @@ class MotionDatabaseView extends ItemView {
   }
 
   _renderOutputBlock(container: HTMLElement, block: SqlOutputBlock, append = false): void {
-    const wrap = document.createDiv();
-    wrap.className = 'mdb-sql-result';
+    const wrap = container.createDiv({ cls: 'mdb-sql-result' });
+    if (!append) container.insertBefore(wrap, container.firstChild);
 
     const result = block.type === 'result' ? block.result : null;
     const isError = block.type === 'error' || result?.type === 'error';
 
     // SQL echo header
     if (block.sql) {
-      const echo = document.createDiv();
-      echo.className = 'mdb-sql-echo';
-      const sqlSpan = document.createEl('code');
-      sqlSpan.className = 'mdb-sql-echo-text';
-      sqlSpan.textContent = block.sql.length > 140 ? block.sql.slice(0, 140) + '…' : block.sql;
-      echo.appendChild(sqlSpan);
-      const meta = document.createSpan();
-      meta.className = 'mdb-sql-echo-meta';
-      meta.textContent = [block.timestamp, block.elapsed != null ? `${block.elapsed}ms` : null].filter(Boolean).join(' · ');
-      echo.appendChild(meta);
-      wrap.appendChild(echo);
+      const echo = wrap.createDiv({ cls: 'mdb-sql-echo' });
+      echo.createEl('code', {
+        cls: 'mdb-sql-echo-text',
+        text: block.sql.length > 140 ? block.sql.slice(0, 140) + '…' : block.sql,
+      });
+      echo.createSpan({
+        cls: 'mdb-sql-echo-meta',
+        text: [block.timestamp, block.elapsed != null ? `${block.elapsed}ms` : null].filter(Boolean).join(' · '),
+      });
     }
 
     // Result body
     if (isError) {
-      const errEl = document.createDiv();
-      errEl.className = 'mdb-sql-error';
+      const errEl = wrap.createDiv({ cls: 'mdb-sql-error' });
       errEl.setAttribute('role', 'alert');
-      const icon = document.createSpan(); icon.className = 'mdb-error-icon'; setIcon(icon, 'alert-circle');
-      const errorCopy = document.createDiv(); errorCopy.className = 'mdb-feedback-copy';
-      const errorTitle = document.createEl('strong'); errorTitle.className = 'mdb-feedback-title'; errorTitle.textContent = 'Query failed';
+      const icon = errEl.createSpan({ cls: 'mdb-error-icon' }); setIcon(icon, 'alert-circle');
+      const errorCopy = errEl.createDiv({ cls: 'mdb-feedback-copy' });
+      errorCopy.createEl('strong', { cls: 'mdb-feedback-title', text: 'Query failed' });
       const errorMessage = block.type === 'error'
         ? block.message
         : result?.type === 'error' ? result.message : 'The query could not be completed.';
-      const msg = document.createDiv(); msg.className = 'mdb-error-msg'; msg.textContent = errorMessage;
-      errorCopy.appendChild(errorTitle); errorCopy.appendChild(msg);
-      errEl.appendChild(icon); errEl.appendChild(errorCopy);
-      wrap.appendChild(errEl);
+      errorCopy.createDiv({ cls: 'mdb-error-msg', text: errorMessage });
 
     } else if (result?.type === 'ok') {
-      const okEl = document.createDiv();
-      okEl.className = 'mdb-sql-ok';
+      const okEl = wrap.createDiv({ cls: 'mdb-sql-ok' });
       okEl.setAttribute('role', 'status');
-      const icon = document.createSpan(); icon.className = 'mdb-ok-icon'; setIcon(icon, 'check');
-      const successCopy = document.createDiv(); successCopy.className = 'mdb-feedback-copy';
-      const successTitle = document.createEl('strong'); successTitle.className = 'mdb-feedback-title'; successTitle.textContent = 'Query complete';
-      const msgEl = document.createDiv(); msgEl.className = 'mdb-ok-msg'; msgEl.textContent = result.message || 'The query completed successfully.';
-      const elapsed = document.createSpan(); elapsed.className = 'mdb-sql-elapsed'; elapsed.textContent = block.elapsed != null ? `${block.elapsed}ms` : '';
-      successCopy.appendChild(successTitle); successCopy.appendChild(msgEl);
-      okEl.appendChild(icon); okEl.appendChild(successCopy); okEl.appendChild(elapsed);
-      wrap.appendChild(okEl);
+      const icon = okEl.createSpan({ cls: 'mdb-ok-icon' }); setIcon(icon, 'check');
+      const successCopy = okEl.createDiv({ cls: 'mdb-feedback-copy' });
+      successCopy.createEl('strong', { cls: 'mdb-feedback-title', text: 'Query complete' });
+      successCopy.createDiv({ cls: 'mdb-ok-msg', text: result.message || 'The query completed successfully.' });
+      okEl.createSpan({ cls: 'mdb-sql-elapsed', text: block.elapsed != null ? `${block.elapsed}ms` : '' });
 
     } else if (result?.type === 'rows') {
       const rowCount = result.rows.length;
-      const meta = document.createDiv();
-      meta.className = 'mdb-result-meta';
-      const countEl = document.createSpan();
-      countEl.className = 'mdb-result-count';
-      countEl.textContent = rowCount === 0 ? 'Empty set (0 rows)' : `${rowCount} row${rowCount !== 1 ? 's' : ''}`;
-      meta.appendChild(countEl);
+      const meta = wrap.createDiv({ cls: 'mdb-result-meta' });
+      meta.createSpan({
+        cls: 'mdb-result-count',
+        text: rowCount === 0 ? 'Empty set (0 rows)' : `${rowCount} row${rowCount !== 1 ? 's' : ''}`,
+      });
       if (block.elapsed != null && block.sql) {
-        const elapsedEl = document.createSpan();
-        elapsedEl.className = 'mdb-sql-elapsed';
-        elapsedEl.textContent = `${block.elapsed}ms`;
-        meta.appendChild(elapsedEl);
+        meta.createSpan({ cls: 'mdb-sql-elapsed', text: `${block.elapsed}ms` });
       }
-      wrap.appendChild(meta);
 
       if (rowCount > 0) {
-        const tableWrap = document.createDiv();
-        tableWrap.className = 'mdb-result-table-wrap';
-        const table = document.createEl('table');
-        table.className = 'mdb-result-table';
+        const tableWrap = wrap.createDiv({ cls: 'mdb-result-table-wrap' });
+        const table = tableWrap.createEl('table', { cls: 'mdb-result-table' });
         const thead = table.createTHead().insertRow();
-        result.columns.forEach(c => { const th = document.createEl('th'); th.textContent = String(c); thead.appendChild(th); });
+        result.columns.forEach(c => { thead.createEl('th', { text: String(c) }); });
         const tbody = table.createTBody();
         result.rows.forEach(row => {
           const tr = tbody.insertRow();
           row.forEach(val => {
             const td = tr.insertCell();
             if (val === null || val === undefined) {
-              const span = document.createSpan(); span.className = 'mdb-null'; span.textContent = 'NULL'; td.appendChild(span);
+              td.createSpan({ cls: 'mdb-null', text: 'NULL' });
             } else if (typeof val === 'boolean') {
-              const span = document.createSpan(); span.className = val ? 'mdb-bool-true' : 'mdb-bool-false'; span.textContent = val ? 'TRUE' : 'FALSE'; td.appendChild(span);
+              td.createSpan({ cls: val ? 'mdb-bool-true' : 'mdb-bool-false', text: val ? 'TRUE' : 'FALSE' });
             } else { td.textContent = String(val); }
           });
         });
-        tableWrap.appendChild(table);
-        wrap.appendChild(tableWrap);
       }
     }
-
-    if (append) container.appendChild(wrap);
-    else container.insertBefore(wrap, container.firstChild);
   }
 
   appendOutput(container: HTMLElement, result: SqlRenderResult, elapsed: number): void {
@@ -4775,11 +4755,11 @@ class MotionDatabaseView extends ItemView {
     const tbody = table.createEl('tbody');
 
     // ── Helper: build a cell input for a given column ──
-    const buildInput = (c: DbColumn, value: unknown, inputMap: Record<string, HTMLInputElement>): HTMLInputElement => {
+    const buildInput = (parent: HTMLElement, c: DbColumn, value: unknown, inputMap: Record<string, HTMLInputElement>): HTMLInputElement => {
       // FK column — show a datalist for autocomplete
       if (c.fk) {
         const refTbl = db.tableData(c.fk.table);
-        const inp = document.createEl('input');
+        const inp = parent.createEl('input');
         inp.className = 'mdb-cell-input';
         inp.value = value !== null && value !== undefined ? String(value) : '';
         inp.placeholder = 'NULL';
@@ -4787,16 +4767,15 @@ class MotionDatabaseView extends ItemView {
           const dlId = `mdb-dl-${tableName}-${c.name}`;
           let dl = document.getElementById(dlId);
           if (!dl) {
-            dl = document.createEl('datalist');
-            dl.id = dlId;
+            const dataList = document.body.createEl('datalist');
+            dataList.id = dlId;
             refTbl.rows.forEach(r => {
-              const opt = document.createEl('option');
+              const opt = dataList.createEl('option');
               opt.value = String(r[c.fk.col] ?? '');
               const label = Object.values(r).slice(0, 3).map(value => toDisplayString(value, true)).join(' · ');
               opt.label = label;
-              dl.appendChild(opt);
             });
-            document.body.appendChild(dl);
+            dl = dataList;
           }
           inp.setAttribute('list', dlId);
         }
@@ -4806,7 +4785,7 @@ class MotionDatabaseView extends ItemView {
       // Boolean / INTEGER 0-1 — checkbox
       const presentation = storedColumnPropertyFormat(c);
       if (presentation?.type === 'checkbox' || (!c.presentation && c.type === 'INTEGER' && (c.name.startsWith('is_') || c.name.startsWith('has_')))) {
-        const inp = document.createEl('input');
+        const inp = parent.createEl('input');
         inp.type = 'checkbox';
         inp.className = 'mdb-cell-check';
         inp.checked = value === true || value === 1 || value === '1' || value === 'true';
@@ -4814,7 +4793,7 @@ class MotionDatabaseView extends ItemView {
         return inp;
       }
       // Default — text input
-      const inp = document.createEl('input');
+      const inp = parent.createEl('input');
       inp.className = 'mdb-cell-input';
       const initialValue = value !== null && value !== undefined ? String(value) : '';
       inp.placeholder = c.notNull ? (c.default !== undefined ? String(c.default) : '') : 'NULL';
@@ -4900,8 +4879,7 @@ class MotionDatabaseView extends ItemView {
             // PK/AI — show value as locked badge
             td.createSpan({ cls: 'mdb-cell-locked', text: String(row[col.name] ?? '') });
           } else {
-            const inp = buildInput(col, row[col.name], inputMap);
-            td.appendChild(inp);
+            buildInput(td, col, row[col.name], inputMap);
           }
         });
 
@@ -5028,8 +5006,7 @@ class MotionDatabaseView extends ItemView {
       if (c.ai) {
         td.createSpan({ cls: 'mdb-cell-locked', text: 'auto' });
       } else {
-        const inp = buildInput(c, null, insertInputMap);
-        td.appendChild(inp);
+        buildInput(td, c, null, insertInputMap);
       }
     });
 
@@ -5906,10 +5883,11 @@ function renderEmbedPropertyValue(td: HTMLElement, value: unknown, format: Prope
     if (format.type === 'image' || images.includes(media.extension)) {
       const image = td.createEl('img', { cls: 'mdb-property-image', attr: { src: media.src, alt: media.raw, loading: 'lazy' } });
       image.onerror = () => {
-        const missing = document.createSpan();
-        missing.className = 'mdb-property-missing';
-        missing.textContent = media.raw;
-        image.replaceWith(missing);
+        const parent = image.parentElement;
+        if (!parent) return;
+        const missing = parent.createSpan({ cls: 'mdb-property-missing', text: media.raw });
+        parent.insertBefore(missing, image);
+        image.remove();
       };
     } else if (audio.includes(media.extension)) {
       td.createEl('audio', { cls: 'mdb-property-audio', attr: { src: media.src, controls: 'controls', preload: 'metadata' } });
