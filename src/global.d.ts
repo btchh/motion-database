@@ -1,5 +1,15 @@
 export {};
 
+declare module 'obsidian' {
+  interface Workspace {
+    on(
+      name: 'motion-database:changed',
+      callback: (change: { name: string; filePath: string }) => unknown,
+      ctx?: unknown,
+    ): EventRef;
+  }
+}
+
 declare global {
   interface MotionDatabaseRowsResult {
     type: 'rows';
@@ -20,6 +30,8 @@ declare global {
     query(sql: string, parameters?: unknown[]): Promise<MotionDatabaseResult[]>;
     exec(sql: string): MotionDatabaseResult[];
     tables(): string[];
+    tableData(name: string): unknown;
+    nameFromPath(): string;
     flushSave(): Promise<void>;
   }
 

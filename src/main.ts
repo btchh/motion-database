@@ -1,20 +1,16 @@
-// Transitional while the legacy single-file engine is split into typed modules.
-// Runtime behavior is covered by tests; new modules should not use this marker.
-// @ts-nocheck
-
 import {
-  activeDocument,
   BasesView,
-  createEl,
-  createDiv,
-  createSpan,
+  App,
+  Editor,
   ItemView,
   MarkdownRenderChild,
   Modal,
   Notice,
   Plugin,
+  QueryController,
   setIcon,
   Setting,
+  WorkspaceLeaf,
 } from 'obsidian';
 
 // ── Motion Database Engine ────────────────────────────────────────────────────
@@ -32,6 +28,299 @@ const TT = {
   GT: 'GT', GTE: 'GTE', PLUS: 'PLUS', MINUS: 'MINUS', SLASH: 'SLASH',
   PERCENT: 'PERCENT', CONCAT: 'CONCAT', EOF: 'EOF',
 };
+type TokenType = typeof TT[keyof typeof TT];
+type TokenValue = string | number | null;
+interface Token {
+  type: TokenType;
+  value: TokenValue;
+  raw?: string;
+}
+
+type SqlScalar = string | number | boolean | null;
+type DbRow = Record<string, unknown>;
+interface ForeignKeyDefinition {
+  table: string;
+  col: string;
+  onDelete: ReferentialAction;
+  onUpdate: ReferentialAction;
+}
+interface DbColumn {
+  name: string;
+  type: string;
+  pk: boolean;
+  ai: boolean;
+  notNull: boolean;
+  unique: boolean;
+  default?: unknown;
+  fk: ForeignKeyDefinition | null;
+  presentation?: ColumnPresentation;
+}
+type ColumnPresentation = { type: 'default' } | { type: 'checkbox' } | { type: 'rating'; style: 'stars' | 'hearts' | 'number'; max: number };
+interface IndexDefinition { cols: string[]; unique: boolean }
+interface DbTable {
+  columns: DbColumn[];
+  rows: DbRow[];
+  seq: number;
+  indexes?: Record<string, IndexDefinition>;
+  _derived?: boolean;
+  _temp?: boolean;
+  _view?: boolean;
+}
+interface ViewDefinition { query: SelectStatement; sql: string }
+type ViewMap = Record<string, ViewDefinition>;
+interface DbSchema {
+  [name: string]: DbTable | ViewMap | undefined;
+  __views__?: ViewMap;
+}
+type ReferentialAction = 'CASCADE' | 'RESTRICT' | 'NO ACTION' | 'SET NULL' | 'SET DEFAULT';
+type SqlExpr =
+  | { type: 'LIT'; value: SqlScalar }
+  | { type: 'COL'; table: string | null; col: string }
+  | { type: 'STAR' }
+  | { type: 'BINOP'; op: string; left: SqlExpr; right: SqlExpr }
+  | { type: 'NOT' | 'NEG'; expr: SqlExpr }
+  | { type: 'BETWEEN'; expr: SqlExpr; lo: SqlExpr; hi: SqlExpr }
+  | { type: 'IN' | 'NOT_IN'; expr: SqlExpr; values?: SqlExpr[]; subquery?: SelectStatement }
+  | { type: 'IS_NULL' | 'IS_NOT_NULL'; expr: SqlExpr }
+  | { type: 'AGG'; fn: 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'; distinct: boolean; arg: SqlExpr }
+  | { type: 'FUNC'; name: string; args: SqlExpr[] }
+  | { type: 'COALESCE'; args: SqlExpr[] }
+  | { type: 'CASE'; baseExpr: SqlExpr | null; branches: Array<{ cond: SqlExpr; val: SqlExpr }>; else_: SqlExpr | null }
+  | { type: 'SUBQUERY'; query: SelectStatement };
+type SelectColumn = { type: 'STAR' } | { type: 'EXPR'; expr: SqlExpr; alias: string | null };
+function isSelectExpressionColumn(column: SelectColumn): column is Extract<SelectColumn, { type: 'EXPR' }> {
+  return column.type === 'EXPR';
+}
+type FromRef = { name?: string | null; table?: string | null; subquery?: SelectStatement; alias: string | null };
+type JoinKind = 'INNER' | 'LEFT' | 'RIGHT' | 'CROSS' | 'FULL';
+type JoinClause = FromRef & { kind: JoinKind; on: SqlExpr | null };
+type OrderClause = { expr: SqlExpr; dir: 'ASC' | 'DESC' };
+interface EquiJoinKey { leftAlias: string; leftCol: string; rightCol: string }
+type ColumnConstraint =
+  | { type: 'PRIMARY_KEY'; autoincrement: boolean }
+  | { type: 'AUTOINCREMENT' | 'NOT_NULL' | 'UNIQUE' }
+  | { type: 'DEFAULT'; value: SqlExpr }
+  | { type: 'FOREIGN_KEY'; refTable: string; refCol: string | null; onDelete: ReferentialAction; onUpdate: ReferentialAction };
+type TableConstraint =
+  | { type: 'PRIMARY_KEY'; columns: string[] }
+  | { type: 'UNIQUE'; columns: string[] }
+  | { type: 'FOREIGN_KEY'; col: string; refTable: string; refCol: string; onDelete: ReferentialAction; onUpdate: ReferentialAction };
+type ColumnDefinition = { name: string; dataType: { name: string; size: TokenValue }; constraints: ColumnConstraint[] };
+interface SelectStatement {
+  type: 'SELECT'; distinct: boolean; columns: SelectColumn[]; from: FromRef; joins: JoinClause[];
+  where: SqlExpr | null; groupBy: SqlExpr[]; having: SqlExpr | null; orderBy: OrderClause[];
+  limit: SqlExpr | null; offset: SqlExpr | null;
+  compound: { op: string; all: boolean; right: SelectStatement } | null;
+}
+type SqlStatement = SelectStatement
+  | { type: 'INSERT'; table: string; columns: string[] | null; rows: SqlExpr[][] }
+  | { type: 'UPDATE'; table: string; sets: Array<{ col: string; val: SqlExpr }>; where: SqlExpr | null }
+  | { type: 'DELETE'; table: string; where: SqlExpr | null }
+  | { type: 'CREATE_TABLE'; name: string; ifNotExists: boolean; columns: ColumnDefinition[]; constraints: TableConstraint[] }
+  | { type: 'CREATE_VIEW'; name: string; ifNotExists: boolean; query: SelectStatement; _originalSql: string }
+  | { type: 'CREATE_INDEX'; name: string; table: string; cols: string[]; unique: boolean; ifNotExists: boolean }
+  | { type: 'DROP_TABLE'; name: string; ifExists: boolean }
+  | { type: 'DROP_VIEW'; name: string; ifExists: boolean }
+  | { type: 'DROP_INDEX'; name: string; ifExists: boolean }
+  | { type: 'ALTER_ADD_COLUMN'; table: string; column: ColumnDefinition }
+  | { type: 'ALTER_MODIFY_COLUMN'; table: string; column: ColumnDefinition }
+  | { type: 'ALTER_DROP_COLUMN'; table: string; column: string }
+  | { type: 'ALTER_RENAME_TABLE'; table: string; newName: string }
+  | { type: 'ALTER_RENAME_COLUMN'; table: string; from: string; to: string }
+  | { type: 'TRUNCATE'; table: string }
+  | { type: 'SHOW_TABLES' }
+  | { type: 'SHOW_DATABASES' }
+  | { type: 'BEGIN' }
+  | { type: 'COMMIT' }
+  | { type: 'ROLLBACK' }
+  | { type: 'DESCRIBE'; table: string }
+  | { type: 'PRAGMA'; name: string; arg: string | null }
+  | { type: 'SAVEPOINT'; name: string }
+  | { type: 'RELEASE'; name: string }
+  | { type: 'ROLLBACK_TO'; name: string }
+  | { type: 'EXPLAIN'; stmt: SqlStatement }
+  | { type: 'WITH'; recursive: boolean; ctes: Array<{ name: string; query: SelectStatement }>; stmt: SqlStatement };
+type SqlResult =
+  | { type: 'ok'; message: string; count?: number; _committed?: boolean; _rolledBack?: boolean }
+  | { type: 'rows'; columns: string[]; rows: unknown[][] };
+type RowsResult = Extract<SqlResult, { type: 'rows' }>;
+type EvalRow = DbRow & { __grp__?: EvalRow[]; __outer__?: EvalRow };
+type SqlRenderResult = SqlResult | { type: 'error'; message: string };
+type SqlOutputBlock = (
+  | { type: 'result'; result: SqlRenderResult }
+  | { type: 'error'; message: string }
+) & { sql?: string | null; timestamp?: string | null; elapsed?: number };
+
+interface MotionDatabasePluginAPI extends Plugin {
+  databases: Map<string, MotionDB>;
+  getDatabase(filePath: string): Promise<MotionDB>;
+  registerDatabase(db: MotionDB): MotionDB;
+  deleteDatabase(filePath: string): Promise<void>;
+  openHome(): Promise<void>;
+  openInLeaf(filePath: string): Promise<void>;
+}
+
+interface MotionDBAPI {
+  create(name: string): Promise<MotionDB>;
+  open(name: string): Promise<MotionDB>;
+  query(dbName: string, sql: string, parameters?: unknown[]): Promise<SqlResult[]>;
+  select(dbName: string, sql: string, parameters?: unknown[]): Promise<DbRow[]>;
+  list(): Promise<Array<{ name: string; tables: string[] }>>;
+  exec(db: MotionDB, sql: string, parameters?: unknown[]): Promise<SqlResult[]>;
+  seed(dbName: string): Promise<{ ok: number; errors: Array<{ type: 'error'; message: string }> }>;
+  version: number;
+  subscribe(callback: (change: { name: string; filePath: string }) => void): () => void;
+}
+type PropertyFormat =
+  | { type: 'text' | 'default' | 'checkbox' | 'image' | 'media' }
+  | { type: 'progress'; max?: number }
+  | { type: 'rating'; style: 'stars' | 'hearts' | 'number'; max: number };
+type PropertyFormats = Record<string, PropertyFormat>;
+interface EmbedPropertyRenderOptions {
+  app?: App;
+  sourcePath?: string;
+  editable?: boolean;
+  onChange?: (value: unknown) => void;
+}
+interface QueryResultsOptions extends EmbedPropertyRenderOptions {
+  label?: string | null;
+  interactive?: boolean;
+  formats?: PropertyFormats;
+  canEdit?: (rowIndex: number, columnIndex: number) => boolean;
+  canAdd?: (columnIndex: number) => boolean;
+  onEdit?: (rowIndex: number, columnIndex: number, value: unknown) => Promise<void>;
+  onDelete?: (rowIndex: number) => Promise<void>;
+  onAdd?: (values: Array<{ columnIndex: number; value: unknown }>) => Promise<void>;
+}
+interface EmbedMediaResource { raw: string; src: string; extension: string }
+interface DatabaseSummary {
+  filePath: string;
+  name: string;
+  tables: number;
+  rows: number;
+  views: number;
+  mtime: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isSqlScalar(value: unknown): value is SqlScalar {
+  return value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function parseSqlDate(value: unknown): Date | null {
+  if (typeof value !== 'string' && typeof value !== 'number' && !(value instanceof Date)) return null;
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function isDbTable(value: unknown): value is DbTable {
+  if (!isRecord(value) || !Array.isArray(value.columns) || !Array.isArray(value.rows) || typeof value.seq !== 'number') return false;
+  const validColumns = value.columns.every(column => isRecord(column)
+    && typeof column.name === 'string'
+    && typeof column.type === 'string'
+    && typeof column.pk === 'boolean'
+    && typeof column.ai === 'boolean'
+    && typeof column.notNull === 'boolean'
+    && typeof column.unique === 'boolean'
+    && (column.fk === null || (isRecord(column.fk)
+      && typeof column.fk.table === 'string'
+      && typeof column.fk.col === 'string'
+      && typeof column.fk.onDelete === 'string'
+      && typeof column.fk.onUpdate === 'string')));
+  const validRows = value.rows.every(row => isRecord(row));
+  return validColumns && validRows;
+}
+
+function isSqlExpr(value: unknown): value is SqlExpr {
+  if (!isRecord(value) || typeof value.type !== 'string') return false;
+  const expr = (candidate: unknown): boolean => isSqlExpr(candidate);
+  switch (value.type) {
+    case 'LIT': return value.value === null || ['string', 'number', 'boolean'].includes(typeof value.value);
+    case 'COL': return (value.table === null || typeof value.table === 'string') && typeof value.col === 'string';
+    case 'STAR': return true;
+    case 'BINOP': return typeof value.op === 'string' && expr(value.left) && expr(value.right);
+    case 'NOT': case 'NEG': case 'IS_NULL': case 'IS_NOT_NULL': return expr(value.expr);
+    case 'BETWEEN': return expr(value.expr) && expr(value.lo) && expr(value.hi);
+    case 'IN': case 'NOT_IN': return expr(value.expr)
+      && (Array.isArray(value.values) ? value.values.every(expr) : isSelectStatement(value.subquery));
+    case 'AGG': return ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'].includes(String(value.fn))
+      && typeof value.distinct === 'boolean' && expr(value.arg);
+    case 'FUNC': return typeof value.name === 'string' && Array.isArray(value.args) && value.args.every(expr);
+    case 'COALESCE': return Array.isArray(value.args) && value.args.every(expr);
+    case 'CASE': return (value.baseExpr === null || expr(value.baseExpr))
+      && Array.isArray(value.branches)
+      && value.branches.every(branch => isRecord(branch) && expr(branch.cond) && expr(branch.val))
+      && (value.else_ === null || expr(value.else_));
+    case 'SUBQUERY': return isSelectStatement(value.query);
+    default: return false;
+  }
+}
+
+function isSelectStatement(value: unknown): value is SelectStatement {
+  if (!isRecord(value) || value.type !== 'SELECT' || typeof value.distinct !== 'boolean') return false;
+  const validColumn = (column: unknown): boolean => isRecord(column)
+    && (column.type === 'STAR' || ((column.type === undefined || column.type === 'EXPR')
+      && isSqlExpr(column.expr) && (column.alias === null || typeof column.alias === 'string')));
+  const validFrom = (from: unknown): boolean => isRecord(from)
+    && (from.name === null || from.name === undefined || typeof from.name === 'string')
+    && (from.table === null || from.table === undefined || typeof from.table === 'string')
+    && (from.alias === null || typeof from.alias === 'string')
+    && (from.subquery === undefined || isSelectStatement(from.subquery));
+  const validOrder = (order: unknown): boolean => isRecord(order)
+    && isSqlExpr(order.expr) && (order.dir === 'ASC' || order.dir === 'DESC');
+  return Array.isArray(value.columns) && value.columns.length > 0 && value.columns.every(validColumn)
+    && validFrom(value.from)
+    && Array.isArray(value.joins) && value.joins.every(join => isRecord(join)
+      && ['INNER', 'LEFT', 'RIGHT', 'CROSS', 'FULL'].includes(String(join.kind))
+      && validFrom(join)
+      && (join.on === null || isSqlExpr(join.on)))
+    && (value.where === null || isSqlExpr(value.where))
+    && Array.isArray(value.groupBy) && value.groupBy.every(isSqlExpr)
+    && (value.having === null || isSqlExpr(value.having))
+    && Array.isArray(value.orderBy) && value.orderBy.every(validOrder)
+    && (value.limit === null || isSqlExpr(value.limit))
+    && (value.offset === null || isSqlExpr(value.offset))
+    && (value.compound === null || (isRecord(value.compound)
+      && typeof value.compound.op === 'string'
+      && typeof value.compound.all === 'boolean'
+      && isSelectStatement(value.compound.right)));
+}
+
+function isViewMap(value: unknown): value is ViewMap {
+  return isRecord(value) && Object.values(value).every(view => isRecord(view)
+    && typeof view.sql === 'string'
+    && isSelectStatement(view.query));
+}
+
+function isDbSchema(value: unknown): value is DbSchema {
+  if (!isRecord(value)) return false;
+  return Object.entries(value).every(([name, entry]) => name === '__views__'
+    ? isViewMap(entry)
+    : isDbTable(entry));
+}
+
+function normalizeLegacySelectColumnTags(value: unknown): void {
+  if (Array.isArray(value)) {
+    value.forEach(normalizeLegacySelectColumnTags);
+    return;
+  }
+  if (!isRecord(value)) return;
+  if (value.type === 'SELECT' && Array.isArray(value.columns)) {
+    for (const column of value.columns) {
+      if (isRecord(column) && column.type === undefined && isSqlExpr(column.expr)) {
+        column.type = 'EXPR';
+      }
+    }
+  }
+  Object.values(value).forEach(normalizeLegacySelectColumnTags);
+}
 
 const KEYWORDS = new Set([
   'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET',
@@ -53,8 +342,8 @@ const KEYWORDS = new Set([
   'OVER', 'PARTITION', 'ROW_NUMBER', 'RANK', 'DENSE_RANK',
 ]);
 
-function tokenize(sql) {
-  const tokens = [];
+function tokenize(sql: string): Token[] {
+  const tokens: Token[] = [];
   let i = 0;
   const s = sql.trim();
 
@@ -113,7 +402,7 @@ function tokenize(sql) {
     if (two === '>=') { tokens.push({ type: TT.GTE, value: '>=' }); i += 2; continue; }
     if (two === '||') { tokens.push({ type: TT.CONCAT, value: '||' }); i += 2; continue; }
 
-    const MAP = {
+    const MAP: Record<string, TokenType> = {
       '*': TT.STAR, ',': TT.COMMA, '(': TT.LPAREN, ')': TT.RPAREN, ';': TT.SEMI,
       '.': TT.DOT, '=': TT.EQ, '<': TT.LT, '>': TT.GT, '+': TT.PLUS,
       '-': TT.MINUS, '/': TT.SLASH, '%': TT.PERCENT
@@ -129,33 +418,40 @@ function tokenize(sql) {
 // ── Parser ─────────────────────────────────────────────────────────────────────
 
 class Parser {
-  constructor(tokens) { this.tokens = tokens; this.pos = 0; }
+  tokens: Token[];
+  pos: number;
 
-  peek() { return this.tokens[this.pos]; }
-  next() { return this.tokens[this.pos++]; }
-  expect(type, value) {
+  constructor(tokens: Token[]) { this.tokens = tokens; this.pos = 0; }
+
+  peek(): Token { return this.tokens[this.pos]; }
+  next(): Token { return this.tokens[this.pos++]; }
+  expect(type: TokenType, value?: TokenValue): Token {
     const t = this.next();
     if (t.type !== type || (value !== undefined && t.value !== value))
       throw new Error(`Expected ${value || type}, got '${t.value}'`);
     return t;
   }
-  match(type, value) {
+  match(type: TokenType, value?: TokenValue): Token | null {
     const t = this.peek();
     if (t.type === type && (value === undefined || t.value === value)) { this.pos++; return t; }
     return null;
   }
-  matchKw(kw) { return this.match(TT.KEYWORD, kw); }
-  isKw(kw) { const t = this.peek(); return t.type === TT.KEYWORD && t.value === kw; }
-  isIdent() { const t = this.peek(); return t.type === TT.IDENT || t.type === TT.KEYWORD; }
+  matchKw(kw: string): Token | null { return this.match(TT.KEYWORD, kw); }
+  isKw(kw: string): boolean { const t = this.peek(); return t.type === TT.KEYWORD && t.value === kw; }
+  isIdent(): boolean { const t = this.peek(); return t.type === TT.IDENT || t.type === TT.KEYWORD; }
 
-  identifier() {
+  identifier(): string {
     const t = this.peek();
-    if (t.type === TT.IDENT || t.type === TT.KEYWORD) { this.pos++; return t.raw || t.value; }
+    if (t.type === TT.IDENT || t.type === TT.KEYWORD) {
+      this.pos++;
+      if (typeof t.raw === 'string') return t.raw;
+      if (typeof t.value === 'string') return t.value;
+    }
     throw new Error(`Expected identifier, got '${t.value}'`);
   }
 
-  parse() {
-    const stmts = [];
+  parse(): SqlStatement[] {
+    const stmts: SqlStatement[] = [];
     while (this.peek().type !== TT.EOF) {
       if (this.match(TT.SEMI)) continue;
       stmts.push(this.parseStatement());
@@ -164,7 +460,7 @@ class Parser {
     return stmts;
   }
 
-  parseStatement() {
+  parseStatement(): SqlStatement {
     const t = this.peek();
     if (t.type !== TT.KEYWORD) throw new Error(`Expected SQL statement, got '${t.value}'`);
     switch (t.value) {
@@ -191,7 +487,7 @@ class Parser {
   }
 
   // ── SELECT ──
-  parseSelect() {
+  parseSelect(): SelectStatement {
     this.expect(TT.KEYWORD, 'SELECT');
     const distinct = !!this.matchKw('DISTINCT');
     const columns = this.parseSelectColumns();
@@ -205,9 +501,9 @@ class Parser {
     const limit = this.matchKw('LIMIT') ? this.parseExpr() : null;
     const offset = this.matchKw('OFFSET') ? this.parseExpr() : null;
     // UNION / INTERSECT / EXCEPT
-    let compound = null;
+    let compound: SelectStatement['compound'] = null;
     if (this.isKw('UNION') || this.isKw('INTERSECT') || this.isKw('EXCEPT')) {
-      const op = this.next().value;
+      const op = String(this.next().value);
       const all = !!this.matchKw('ALL');
       const right = this.parseSelect();
       compound = { op, all, right };
@@ -215,16 +511,17 @@ class Parser {
     return { type: 'SELECT', distinct, columns, from, joins, where, groupBy, having, orderBy, limit, offset, compound };
   }
 
-  parseSelectColumns() {
+  parseSelectColumns(): SelectColumn[] {
     if (this.match(TT.STAR)) return [{ type: 'STAR' }];
-    const cols = []; cols.push(this.parseSelectColumn());
+    const cols: Array<Exclude<SelectColumn, { type: 'STAR' }>> = [];
+    cols.push(this.parseSelectColumn());
     while (this.match(TT.COMMA)) cols.push(this.parseSelectColumn());
     return cols;
   }
 
-  parseSelectColumn() {
+  parseSelectColumn(): Exclude<SelectColumn, { type: 'STAR' }> {
     const expr = this.parseExpr();
-    let alias = null;
+    let alias: string | null = null;
     if (this.matchKw('AS')) {
       alias = this.identifier();
     } else if (this.isIdent() && !this.isKw('FROM') && !this.isKw('WHERE') && !this.isKw('ORDER') && !this.isKw('GROUP') && !this.isKw('HAVING') && !this.isKw('LIMIT') && !this.isKw('OFFSET') && !this.isKw('UNION') && !this.isKw('INTERSECT') && !this.isKw('EXCEPT')) {
@@ -234,10 +531,10 @@ class Parser {
       // major SQL dialect makes for implicit aliases.
       alias = this.identifier();
     }
-    return { expr, alias };
+    return { type: 'EXPR', expr, alias };
   }
 
-  parseFromClause() {
+  parseFromClause(): FromRef {
     // Derived table: FROM (SELECT ...) alias
     if (this.peek().type === TT.LPAREN && this.tokens[this.pos + 1]?.type === TT.KEYWORD && this.tokens[this.pos + 1]?.value === 'SELECT') {
       this.next(); // consume (
@@ -252,10 +549,10 @@ class Parser {
     return { name, alias };
   }
 
-  parseJoins() {
-    const joins = [];
+  parseJoins(): JoinClause[] {
+    const joins: JoinClause[] = [];
     while (true) {
-      let kind = 'INNER';
+      let kind: JoinKind = 'INNER';
       if (this.matchKw('LEFT')) { this.matchKw('OUTER'); kind = 'LEFT'; }
       else if (this.matchKw('RIGHT')) { this.matchKw('OUTER'); kind = 'RIGHT'; }
       else if (this.matchKw('INNER')) { this.expect(TT.KEYWORD, 'JOIN'); kind = 'INNER'; }
@@ -266,7 +563,8 @@ class Parser {
       // Consume JOIN for LEFT/RIGHT/CROSS/FULL (INNER already consumed it above; bare JOIN consumed it in matchKw)
       if (kind !== 'INNER') this.matchKw('JOIN');
       // Derived table: JOIN (SELECT ...) alias ON ...
-      let table = null, subquery = null;
+      let table: string | null = null;
+      let subquery: SelectStatement | null = null;
       if (this.peek().type === TT.LPAREN && this.tokens[this.pos + 1]?.type === TT.KEYWORD && this.tokens[this.pos + 1]?.value === 'SELECT') {
         this.next(); // consume (
         subquery = this.parseSelect();
@@ -275,7 +573,7 @@ class Parser {
         table = this.identifier();
       }
       // Support both explicit alias (AS alias) and implicit alias (table alias)
-      let alias = null;
+      let alias: string | null = null;
       if (this.matchKw('AS')) {
         alias = this.identifier();
       } else if (this.isIdent() && !this.isKw('ON') && !this.isKw('WHERE') && !this.isKw('JOIN') && !this.isKw('INNER') && !this.isKw('LEFT') && !this.isKw('RIGHT') && !this.isKw('CROSS') && !this.isKw('FULL') && !this.isKw('ORDER') && !this.isKw('GROUP') && !this.isKw('HAVING') && !this.isKw('LIMIT') && !this.isKw('OFFSET') && !this.isKw('UNION') && !this.isKw('INTERSECT') && !this.isKw('EXCEPT')) {
@@ -288,25 +586,25 @@ class Parser {
     return joins;
   }
 
-  parseOrderList() {
-    const parseDir = () => { if (this.matchKw('DESC')) return 'DESC'; this.matchKw('ASC'); return 'ASC'; };
-    const list = [{ expr: this.parseExpr(), dir: parseDir() }];
+  parseOrderList(): OrderClause[] {
+    const parseDir = (): OrderClause['dir'] => { if (this.matchKw('DESC')) return 'DESC'; this.matchKw('ASC'); return 'ASC'; };
+    const list: OrderClause[] = [{ expr: this.parseExpr(), dir: parseDir() }];
     while (this.match(TT.COMMA)) list.push({ expr: this.parseExpr(), dir: parseDir() });
     return list;
   }
 
-  parseExprList() {
-    const list = [this.parseExpr()];
+  parseExprList(): SqlExpr[] {
+    const list: SqlExpr[] = [this.parseExpr()];
     while (this.match(TT.COMMA)) list.push(this.parseExpr());
     return list;
   }
 
   // ── INSERT ──
-  parseInsert() {
+  parseInsert(): Extract<SqlStatement, { type: 'INSERT' }> {
     this.expect(TT.KEYWORD, 'INSERT');
     this.expect(TT.KEYWORD, 'INTO');
     const table = this.identifier();
-    let columns = null;
+    let columns: string[] | null = null;
     if (this.match(TT.LPAREN)) {
       columns = [];
       columns.push(this.identifier());
@@ -314,10 +612,10 @@ class Parser {
       this.expect(TT.RPAREN);
     }
     this.expect(TT.KEYWORD, 'VALUES');
-    const rows = [];
+    const rows: SqlExpr[][] = [];
     do {
       this.expect(TT.LPAREN);
-      const vals = [this.parseExpr()];
+      const vals: SqlExpr[] = [this.parseExpr()];
       while (this.match(TT.COMMA)) vals.push(this.parseExpr());
       this.expect(TT.RPAREN);
       rows.push(vals);
@@ -326,11 +624,11 @@ class Parser {
   }
 
   // ── UPDATE ──
-  parseUpdate() {
+  parseUpdate(): Extract<SqlStatement, { type: 'UPDATE' }> {
     this.expect(TT.KEYWORD, 'UPDATE');
     const table = this.identifier();
     this.expect(TT.KEYWORD, 'SET');
-    const sets = [];
+    const sets: Array<{ col: string; val: SqlExpr }> = [];
     do {
       const col = this.identifier();
       this.expect(TT.EQ);
@@ -342,7 +640,7 @@ class Parser {
   }
 
   // ── DELETE ──
-  parseDelete() {
+  parseDelete(): Extract<SqlStatement, { type: 'DELETE' }> {
     this.expect(TT.KEYWORD, 'DELETE');
     this.expect(TT.KEYWORD, 'FROM');
     const table = this.identifier();
@@ -351,7 +649,7 @@ class Parser {
   }
 
   // ── CREATE TABLE / VIEW / INDEX ──
-  parseCreate() {
+  parseCreate(): Extract<SqlStatement, { type: 'CREATE_TABLE' | 'CREATE_VIEW' | 'CREATE_INDEX' }> {
     const startPos = this.pos;
     this.expect(TT.KEYWORD, 'CREATE');
     const unique = !!this.matchKw('UNIQUE');
@@ -366,8 +664,8 @@ class Parser {
     const ifNotExists = !!(this.matchKw('IF') && this.matchKw('NOT') && this.matchKw('EXISTS'));
     const name = this.identifier();
     this.expect(TT.LPAREN);
-    const columns = [];
-    const constraints = [];
+    const columns: ColumnDefinition[] = [];
+    const constraints: TableConstraint[] = [];
     while (this.peek().type !== TT.RPAREN) {
       if (this.isKw('PRIMARY') || this.isKw('FOREIGN') || this.isKw('UNIQUE') || this.isKw('CONSTRAINT')) {
         constraints.push(this.parseTableConstraint());
@@ -381,10 +679,10 @@ class Parser {
     return { type: 'CREATE_TABLE', name, ifNotExists, columns, constraints };
   }
 
-  parseColumnDef() {
+  parseColumnDef(): ColumnDefinition {
     const name = this.identifier();
     const dataType = this.parseDataType();
-    const constraints = [];
+    const constraints: ColumnConstraint[] = [];
     while (true) {
       if (this.matchKw('PRIMARY')) {
         this.expect(TT.KEYWORD, 'KEY');
@@ -399,9 +697,10 @@ class Parser {
         constraints.push({ type: 'DEFAULT', value: this.parseExpr() });
       } else if (this.matchKw('REFERENCES')) {
         const refTable = this.identifier();
-        let refCol = null;
+        let refCol: string | null = null;
         if (this.match(TT.LPAREN)) { refCol = this.identifier(); this.expect(TT.RPAREN); }
-        let onDelete = 'NO ACTION', onUpdate = 'NO ACTION';
+        let onDelete: ReferentialAction = 'NO ACTION';
+        let onUpdate: ReferentialAction = 'NO ACTION';
         while (this.matchKw('ON')) {
           const action = this.next().value;
           const rule = this._parseFKAction();
@@ -415,9 +714,9 @@ class Parser {
     return { name, dataType, constraints };
   }
 
-  parseDataType() {
+  parseDataType(): ColumnDefinition['dataType'] {
     const name = this.identifier();
-    let size = null;
+    let size: TokenValue = null;
     if (this.match(TT.LPAREN)) {
       size = this.next().value;
       this.match(TT.COMMA) && this.next();
@@ -427,7 +726,7 @@ class Parser {
   }
 
   // Parses a referential action: CASCADE | RESTRICT | SET NULL | SET DEFAULT | NO ACTION
-  _parseFKAction() {
+  _parseFKAction(): ReferentialAction {
     if (this.matchKw('CASCADE')) return 'CASCADE';
     if (this.matchKw('RESTRICT')) return 'RESTRICT';
     if (this.matchKw('NO')) { this.matchKw('ACTION'); return 'NO ACTION'; }
@@ -439,7 +738,7 @@ class Parser {
     return 'NO ACTION';
   }
 
-  parseTableConstraint() {
+  parseTableConstraint(): TableConstraint {
     this.matchKw('CONSTRAINT') && this.identifier();
     if (this.matchKw('PRIMARY')) {
       this.expect(TT.KEYWORD, 'KEY');
@@ -459,7 +758,8 @@ class Parser {
       this.expect(TT.LPAREN);
       const refCol = this.identifier();
       this.expect(TT.RPAREN);
-      let onDelete = 'NO ACTION', onUpdate = 'NO ACTION';
+      let onDelete: ReferentialAction = 'NO ACTION';
+      let onUpdate: ReferentialAction = 'NO ACTION';
       while (this.matchKw('ON')) {
         const action = this.next().value; // DELETE or UPDATE
         const rule = this._parseFKAction();
@@ -470,7 +770,7 @@ class Parser {
     }
     if (this.matchKw('UNIQUE')) {
       this.expect(TT.LPAREN);
-      const cols = [this.identifier()];
+      const cols: string[] = [this.identifier()];
       while (this.match(TT.COMMA)) cols.push(this.identifier());
       this.expect(TT.RPAREN);
       return { type: 'UNIQUE', columns: cols };
@@ -479,7 +779,7 @@ class Parser {
   }
 
   // ── CREATE VIEW ──
-  parseCreateView(ifNotExists, startPos) {
+  parseCreateView(ifNotExists: boolean, startPos: number): Extract<SqlStatement, { type: 'CREATE_VIEW' }> {
     const name = this.identifier();
     this.expect(TT.KEYWORD, 'AS');
     const query = this.parseSelect();
@@ -493,7 +793,7 @@ class Parser {
   }
 
   // ── CREATE INDEX ──
-  parseCreateIndex(unique) {
+  parseCreateIndex(unique: boolean): Extract<SqlStatement, { type: 'CREATE_INDEX' }> {
     this.matchKw('INDEX');
     const ifNotExists = !!(this.matchKw('IF') && this.matchKw('NOT') && this.matchKw('EXISTS'));
     const name = this.identifier();
@@ -507,7 +807,7 @@ class Parser {
   }
 
   // ── DROP ──
-  parseDrop() {
+  parseDrop(): Extract<SqlStatement, { type: 'DROP_TABLE' | 'DROP_VIEW' | 'DROP_INDEX' }> {
     this.expect(TT.KEYWORD, 'DROP');
     if (this.matchKw('VIEW')) {
       const ifExists = !!(this.matchKw('IF') && this.matchKw('EXISTS'));
@@ -526,7 +826,7 @@ class Parser {
   }
 
   // ── ALTER ──
-  parseAlter() {
+  parseAlter(): Extract<SqlStatement, { type: 'ALTER_ADD_COLUMN' | 'ALTER_MODIFY_COLUMN' | 'ALTER_DROP_COLUMN' | 'ALTER_RENAME_TABLE' | 'ALTER_RENAME_COLUMN' }> {
     this.expect(TT.KEYWORD, 'ALTER');
     this.expect(TT.KEYWORD, 'TABLE');
     const table = this.identifier();
@@ -560,7 +860,7 @@ class Parser {
   }
 
   // ── TRUNCATE ──
-  parseTruncate() {
+  parseTruncate(): Extract<SqlStatement, { type: 'TRUNCATE' }> {
     this.expect(TT.KEYWORD, 'TRUNCATE');
     this.matchKw('TABLE');
     const table = this.identifier();
@@ -568,7 +868,7 @@ class Parser {
   }
 
   // ── SHOW ──
-  parseShow() {
+  parseShow(): Extract<SqlStatement, { type: 'SHOW_TABLES' | 'SHOW_DATABASES' }> {
     this.expect(TT.KEYWORD, 'SHOW');
     if (this.matchKw('TABLES')) return { type: 'SHOW_TABLES' };
     if (this.matchKw('DATABASES')) return { type: 'SHOW_DATABASES' };
@@ -576,24 +876,24 @@ class Parser {
   }
 
   // ── DESCRIBE ──
-  parseDescribe() {
+  parseDescribe(): Extract<SqlStatement, { type: 'DESCRIBE' }> {
     this.next();
     const table = this.identifier();
     return { type: 'DESCRIBE', table };
   }
 
   // ── PRAGMA ──
-  parsePragma() {
+  parsePragma(): Extract<SqlStatement, { type: 'PRAGMA' }> {
     this.expect(TT.KEYWORD, 'PRAGMA');
     const name = this.identifier();
-    let arg = null;
+    let arg: string | null = null;
     if (this.match(TT.LPAREN)) { arg = this.identifier(); this.expect(TT.RPAREN); }
     else if (this.match(TT.EQ)) { arg = this.identifier(); }
     return { type: 'PRAGMA', name, arg };
   }
 
   // ── ROLLBACK / SAVEPOINT / RELEASE ──
-  parseRollback() {
+  parseRollback(): Extract<SqlStatement, { type: 'ROLLBACK' | 'ROLLBACK_TO' }> {
     this.expect(TT.KEYWORD, 'ROLLBACK');
     this.matchKw('TRANSACTION');
     if (this.matchKw('TO')) {
@@ -604,13 +904,13 @@ class Parser {
     return { type: 'ROLLBACK' };
   }
 
-  parseSavepoint() {
+  parseSavepoint(): Extract<SqlStatement, { type: 'SAVEPOINT' }> {
     this.expect(TT.KEYWORD, 'SAVEPOINT');
     const name = this.identifier();
     return { type: 'SAVEPOINT', name };
   }
 
-  parseRelease() {
+  parseRelease(): Extract<SqlStatement, { type: 'RELEASE' }> {
     this.expect(TT.KEYWORD, 'RELEASE');
     this.matchKw('SAVEPOINT');
     const name = this.identifier();
@@ -618,7 +918,7 @@ class Parser {
   }
 
   // ── EXPLAIN ──
-  parseExplain() {
+  parseExplain(): Extract<SqlStatement, { type: 'EXPLAIN' }> {
     this.expect(TT.KEYWORD, 'EXPLAIN');
     this.matchKw('ANALYZE');
     const stmt = this.parseStatement();
@@ -626,10 +926,10 @@ class Parser {
   }
 
   // ── WITH (CTE) ──
-  parseWith() {
+  parseWith(): Extract<SqlStatement, { type: 'WITH' }> {
     this.expect(TT.KEYWORD, 'WITH');
     const recursive = !!this.matchKw('RECURSIVE');
-    const ctes = [];
+    const ctes: Array<{ name: string; query: SelectStatement }> = [];
     do {
       const name = this.identifier();
       this.matchKw('AS'); // WITH name AS (...) — AS is standard but optional here
@@ -644,7 +944,7 @@ class Parser {
 
   // ── Expression parser (Pratt) ──────────────────────────────────────────────
 
-  parseExpr(minPrec = 0) {
+  parseExpr(minPrec = 0): SqlExpr {
     let left = this.parseUnary();
     while (true) {
       const op = this.getBinaryOp();
@@ -665,7 +965,7 @@ class Parser {
           left = { type: 'IN', expr: left, subquery: query };
           continue;
         }
-        const vals = [this.parseExpr()];
+        const vals: SqlExpr[] = [this.parseExpr()];
         while (this.match(TT.COMMA)) vals.push(this.parseExpr());
         this.expect(TT.RPAREN);
         left = { type: 'IN', expr: left, values: vals };
@@ -679,7 +979,7 @@ class Parser {
           left = { type: 'NOT_IN', expr: left, subquery: query };
           continue;
         }
-        const vals = [this.parseExpr()];
+        const vals: SqlExpr[] = [this.parseExpr()];
         while (this.match(TT.COMMA)) vals.push(this.parseExpr());
         this.expect(TT.RPAREN);
         left = { type: 'NOT_IN', expr: left, values: vals };
@@ -693,7 +993,7 @@ class Parser {
     return left;
   }
 
-  getBinaryOp() {
+  getBinaryOp(): { op: string; prec: number; skip?: number; right?: boolean } | null {
     const t = this.peek(), n = this.tokens[this.pos + 1];
     if (t.type === TT.KEYWORD && t.value === 'IS') {
       if (n?.type === TT.KEYWORD && n?.value === 'NOT' && this.tokens[this.pos + 2]?.value === 'NULL')
@@ -723,13 +1023,13 @@ class Parser {
     return null;
   }
 
-  parseUnary() {
+  parseUnary(): SqlExpr {
     if (this.match(TT.KEYWORD, 'NOT')) { return { type: 'NOT', expr: this.parseUnary() }; }
     if (this.match(TT.MINUS)) { return { type: 'NEG', expr: this.parseUnary() }; }
     return this.parsePrimary();
   }
 
-  parsePrimary() {
+  parsePrimary(): SqlExpr {
     const t = this.peek();
 
     // Literals
@@ -740,12 +1040,12 @@ class Parser {
     if (t.type === TT.KEYWORD && t.value === 'FALSE') { this.pos++; return { type: 'LIT', value: false }; }
 
     // Aggregate functions
-    const AGG = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
-    if (t.type === TT.KEYWORD && AGG.includes(t.value)) {
-      const fn = t.value; this.pos++;
+    const AGG: readonly string[] = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+    if (t.type === TT.KEYWORD && typeof t.value === 'string' && AGG.includes(t.value)) {
+      const fn = t.value as 'COUNT' | 'SUM' | 'AVG' | 'MIN' | 'MAX'; this.pos++;
       this.expect(TT.LPAREN);
       const distinct = !!this.matchKw('DISTINCT');
-      let arg;
+      let arg: SqlExpr;
       if (this.match(TT.STAR)) arg = { type: 'STAR' };
       else arg = this.parseExpr();
       this.expect(TT.RPAREN);
@@ -755,7 +1055,7 @@ class Parser {
     // COALESCE
     if (t.type === TT.KEYWORD && t.value === 'COALESCE') {
       this.pos++; this.expect(TT.LPAREN);
-      const args = [this.parseExpr()];
+      const args: SqlExpr[] = [this.parseExpr()];
       while (this.match(TT.COMMA)) args.push(this.parseExpr());
       this.expect(TT.RPAREN);
       return { type: 'COALESCE', args };
@@ -767,7 +1067,7 @@ class Parser {
       // Simple CASE: CASE expr WHEN val THEN result ...
       // Searched CASE: CASE WHEN cond THEN result ...
       const baseExpr = this.isKw('WHEN') || this.isKw('ELSE') || this.isKw('END') ? null : this.parseExpr();
-      const branches = [];
+      const branches: Array<{ cond: SqlExpr; val: SqlExpr }> = [];
       while (this.matchKw('WHEN')) {
         const cond = this.parseExpr();
         this.expect(TT.KEYWORD, 'THEN');
@@ -794,12 +1094,12 @@ class Parser {
     // Column ref: table.col or col
     if (t.type === TT.IDENT || t.type === TT.KEYWORD) {
       this.pos++;
-      const name = t.raw || t.value;
+      const name = t.raw ?? String(t.value);
       if (this.match(TT.DOT)) {
         const col = this.identifier();
         // Could be a function call
         if (this.match(TT.LPAREN)) {
-          const args = [];
+          const args: SqlExpr[] = [];
           if (!this.match(TT.RPAREN)) {
             args.push(this.parseExpr());
             while (this.match(TT.COMMA)) args.push(this.parseExpr());
@@ -811,7 +1111,7 @@ class Parser {
       }
       // Function call
       if (this.match(TT.LPAREN)) {
-        const args = [];
+        const args: SqlExpr[] = [];
         if (!this.match(TT.RPAREN)) {
           if (this.match(TT.STAR)) args.push({ type: 'STAR' });
           else args.push(this.parseExpr());
@@ -830,6 +1130,13 @@ class Parser {
 // ── Executor ───────────────────────────────────────────────────────────────────
 
 class MotionDBEngine {
+  schema: DbSchema;
+  _txStack: Array<{ name: string | null; snapshot: DbSchema }> = [];
+  _inTx = false;
+  _dirty = false;
+  _lastInsertRowId: unknown = null;
+  _lastChangeCount = 0;
+
   constructor() {
     // schema: { tableName: { columns:[{name,type,pk,ai,notNull,unique,default,fk}], rows:[], seq:0 } }
     this.schema = {};
@@ -837,19 +1144,22 @@ class MotionDBEngine {
 
   // ── Public: execute SQL string ─────────────────────────────────────────────
 
-  exec(sql) {
+  exec(sql: string): SqlResult[] {
     const tokens = tokenize(sql);
     const parser = new Parser(tokens);
     const stmts = parser.parse();
-    const results = [];
+    const results: SqlResult[] = [];
     const WRITES = new Set(['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'CREATE_TABLE', 'DROP_TABLE',
       'ALTER_ADD_COLUMN', 'ALTER_DROP_COLUMN', 'ALTER_RENAME_TABLE', 'ALTER_RENAME_COLUMN',
       'ALTER_MODIFY_COLUMN', 'CREATE_VIEW', 'DROP_VIEW', 'CREATE_INDEX', 'DROP_INDEX', 'COMMIT', 'RELEASE']);
-    const effectiveStatement = stmt => stmt.type === 'WITH' ? effectiveStatement(stmt.stmt) : stmt;
-    const knownNoop = stmt => {
+    const effectiveStatement = (stmt: SqlStatement): SqlStatement => stmt.type === 'WITH' ? effectiveStatement(stmt.stmt) : stmt;
+    const knownNoop = (stmt: SqlStatement): boolean => {
       if (stmt.type === 'CREATE_TABLE') return Boolean(stmt.ifNotExists && this.schema[stmt.name.toLowerCase()]);
       if (stmt.type === 'CREATE_VIEW') return Boolean(stmt.ifNotExists && this.schema.__views__?.[stmt.name.toLowerCase()]);
-      if (stmt.type === 'CREATE_INDEX') return Boolean(stmt.ifNotExists && this.schema[stmt.table.toLowerCase()]?.indexes?.[stmt.name]);
+      if (stmt.type === 'CREATE_INDEX') {
+        const table = this.schema[stmt.table.toLowerCase()];
+        return Boolean(stmt.ifNotExists && isDbTable(table) && table.indexes?.[stmt.name]);
+      }
       return false;
     };
     // Treat a multi-statement batch atomically when it is executed outside an
@@ -864,7 +1174,7 @@ class MotionDBEngine {
       } catch (e) {
         if (this._inTx) {
           this._doRollback();
-          throw new Error(`${e.message}\n[Transaction automatically rolled back]`);
+          throw new Error(`${errorMessage(e)}\n[Transaction automatically rolled back]`);
         }
         if (batchSnapshot) this.schema = batchSnapshot;
         throw e;
@@ -883,7 +1193,7 @@ class MotionDBEngine {
     return results;
   }
 
-  execStmt(stmt) {
+  execStmt(stmt: SqlStatement): SqlResult {
     switch (stmt.type) {
       case 'SELECT': return this.execSelect(stmt);
       case 'INSERT': return this.execInsert(stmt);
@@ -913,13 +1223,13 @@ class MotionDBEngine {
       case 'SHOW_DATABASES': return { type: 'rows', columns: ['Database'], rows: [['motion_db']] };
       case 'DESCRIBE': return this.execDescribe(stmt);
       case 'PRAGMA': return this.execPragma(stmt);
-      default: throw new Error(`Unimplemented: ${stmt.type}`);
+      default: throw new Error('Unimplemented SQL statement.');
     }
   }
 
   // ── CREATE TABLE ──────────────────────────────────────────────────────────
 
-  execCreateTable(stmt) {
+  execCreateTable(stmt: Extract<SqlStatement, { type: 'CREATE_TABLE' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     if (this.schema[name]) {
       if (stmt.ifNotExists) return { type: 'ok', message: `Table '${name}' already exists.` };
@@ -962,8 +1272,8 @@ class MotionDBEngine {
     return { type: 'ok', message: `Table '${name}' created.` };
   }
 
-  normalizeType(t) {
-    const map = {
+  normalizeType(t: string): string {
+    const map: Record<string, string> = {
       'INT': 'INTEGER', 'BIGINT': 'INTEGER', 'SMALLINT': 'INTEGER', 'SERIAL': 'INTEGER',
       'FLOAT': 'REAL', 'DOUBLE': 'REAL', 'NUMERIC': 'REAL',
       'VARCHAR': 'TEXT', 'CHAR': 'TEXT', 'BLOB': 'TEXT',
@@ -972,7 +1282,7 @@ class MotionDBEngine {
     return map[t] || t;
   }
 
-  coerceValue(val, colType) {
+  coerceValue(val: unknown, colType: string): unknown {
     if (val === null || val === undefined) return null;
     switch (colType) {
       case 'INTEGER': {
@@ -992,7 +1302,7 @@ class MotionDBEngine {
 
   // ── DROP TABLE ────────────────────────────────────────────────────────────
 
-  execDropTable(stmt) {
+  execDropTable(stmt: Extract<SqlStatement, { type: 'DROP_TABLE' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     if (!this.schema[name]) {
       if (stmt.ifExists) return { type: 'ok', message: `Table '${name}' does not exist.` };
@@ -1001,6 +1311,7 @@ class MotionDBEngine {
     // Refuse if another table has a FK pointing at this table
     for (const [tname, tbl] of Object.entries(this.schema)) {
       if (tname === name || tname === '__views__') continue;
+      if (!isDbTable(tbl)) continue;
       const ref = tbl.columns?.find(c => c.fk?.table === name);
       if (ref) throw new Error(`Cannot drop table '${name}': table '${tname}' has a FOREIGN KEY on column '${ref.name}' that references it. Drop or alter '${tname}' first.`);
     }
@@ -1010,7 +1321,7 @@ class MotionDBEngine {
 
   // ── ALTER TABLE ───────────────────────────────────────────────────────────
 
-  execAlterAdd(stmt) {
+  execAlterAdd(stmt: Extract<SqlStatement, { type: 'ALTER_ADD_COLUMN' }>): SqlResult {
     const tbl = this.getTable(stmt.table);
     const cd = stmt.column;
     const col = {
@@ -1028,7 +1339,7 @@ class MotionDBEngine {
     return { type: 'ok', message: `Column '${col.name}' added to '${stmt.table.toLowerCase()}'.` };
   }
 
-  execAlterDrop(stmt) {
+  execAlterDrop(stmt: Extract<SqlStatement, { type: 'ALTER_DROP_COLUMN' }>): SqlResult {
     const tname = stmt.table.toLowerCase();
     const tbl = this.getTable(tname);
     const cn = stmt.column.toLowerCase();
@@ -1037,7 +1348,7 @@ class MotionDBEngine {
     if (col.pk) throw new Error(`Cannot drop primary key column '${cn}'. Drop the table and recreate it instead.`);
     // Refuse if another table has a FK pointing at this column
     for (const [otherName, otherTbl] of Object.entries(this.schema)) {
-      if (otherName === '__views__' || !Array.isArray(otherTbl.columns)) continue;
+      if (otherName === '__views__' || !isDbTable(otherTbl)) continue;
       const ref = otherTbl.columns.find(c => c.fk?.table === tname && c.fk?.col === cn);
       if (ref) throw new Error(`Cannot drop '${cn}': table '${otherName}' has a FOREIGN KEY on '${ref.name}' that references it.`);
     }
@@ -1046,21 +1357,22 @@ class MotionDBEngine {
     return { type: 'ok', message: `Column '${cn}' dropped.` };
   }
 
-  execAlterRenameTable(stmt) {
+  execAlterRenameTable(stmt: Extract<SqlStatement, { type: 'ALTER_RENAME_TABLE' }>): SqlResult {
     const old = stmt.table.toLowerCase(), nw = stmt.newName.toLowerCase();
-    if (!this.schema[old]) throw new Error(`Table '${old}' not found.`);
+    const table = this.schema[old];
+    if (!isDbTable(table)) throw new Error(`Table '${old}' not found.`);
     if (this.schema[nw]) throw new Error(`Table '${nw}' already exists.`);
-    this.schema[nw] = this.schema[old];
+    this.schema[nw] = table;
     delete this.schema[old];
     // Update any FK references in other tables that pointed at the old name
     for (const tbl of Object.values(this.schema)) {
-      if (!Array.isArray(tbl.columns)) continue;
+      if (!isDbTable(tbl)) continue;
       tbl.columns.forEach(c => { if (c.fk?.table === old) c.fk.table = nw; });
     }
     return { type: 'ok', message: `Table renamed to '${nw}'.` };
   }
 
-  execAlterRenameColumn(stmt) {
+  execAlterRenameColumn(stmt: Extract<SqlStatement, { type: 'ALTER_RENAME_COLUMN' }>): SqlResult {
     const tname = stmt.table.toLowerCase();
     const tbl = this.getTable(tname);
     const from = stmt.from.toLowerCase(), to = stmt.to.toLowerCase();
@@ -1081,13 +1393,13 @@ class MotionDBEngine {
     });
     // Update any FK references in other tables that pointed at the old column name on this table
     for (const otherTbl of Object.values(this.schema)) {
-      if (!Array.isArray(otherTbl.columns)) continue;
+      if (!isDbTable(otherTbl)) continue;
       otherTbl.columns.forEach(c => { if (c.fk?.table === tname && c.fk.col === from) c.fk.col = to; });
     }
     return { type: 'ok', message: `Column renamed to '${to}'.` };
   }
 
-  execAlterModify(stmt) {
+  execAlterModify(stmt: Extract<SqlStatement, { type: 'ALTER_MODIFY_COLUMN' }>): SqlResult {
     const tbl = this.getTable(stmt.table);
     const cd = stmt.column;
     const col = tbl.columns.find(c => c.name === cd.name.toLowerCase());
@@ -1103,12 +1415,12 @@ class MotionDBEngine {
 
   // ── TRUNCATE ──────────────────────────────────────────────────────────────
 
-  execTruncate(stmt) {
+  execTruncate(stmt: Extract<SqlStatement, { type: 'TRUNCATE' }>): SqlResult {
     const tname = stmt.table.toLowerCase();
     const tbl = this.getTable(tname);
     // Refuse if any other table has FK rows referencing this one
     for (const [otherName, otherTbl] of Object.entries(this.schema)) {
-      if (otherName === '__views__' || !Array.isArray(otherTbl.columns)) continue;
+      if (otherName === '__views__' || !isDbTable(otherTbl)) continue;
       for (const col of otherTbl.columns) {
         if (!col.fk || col.fk.table !== tname) continue;
         if (otherTbl.rows.some(r => r[col.name] !== null && r[col.name] !== undefined))
@@ -1121,7 +1433,7 @@ class MotionDBEngine {
 
   // ── INSERT ────────────────────────────────────────────────────────────────
 
-  execInsert(stmt) {
+  execInsert(stmt: Extract<SqlStatement, { type: 'INSERT' }>): SqlResult {
     const tbl = this.getTable(stmt.table);
     const cols = stmt.columns ? stmt.columns.map(c => c.toLowerCase()) : tbl.columns.filter(c => !c.ai).map(c => c.name);
     let count = 0;
@@ -1130,7 +1442,7 @@ class MotionDBEngine {
       if (valExprs.length !== cols.length)
         throw new Error(`Column count mismatch: expected ${cols.length}, got ${valExprs.length}`);
 
-      const row = {};
+      const row: DbRow = {};
       // Pre-create every column key up front, in schema order, so the row
       // object's own key order (used by SELECT * / DataviewJS output) always
       // matches the declared column order — regardless of which columns the
@@ -1176,14 +1488,14 @@ class MotionDBEngine {
 
   // ── UPDATE ────────────────────────────────────────────────────────────────
 
-  execUpdate(stmt) {
+  execUpdate(stmt: Extract<SqlStatement, { type: 'UPDATE' }>): SqlResult {
     const tname = stmt.table.toLowerCase();
     const tbl = this.getTable(tname);
     let count = 0;
     tbl.rows.forEach(row => {
       const ctx = this.rowCtx(tname, row);
       if (stmt.where && !this.toBool(this.evalExpr(stmt.where, ctx))) return;
-      const patch = { ...row };
+      const patch: DbRow = { ...row };
       stmt.sets.forEach(s => {
         const cn = s.col.toLowerCase();
         const col = tbl.columns.find(c => c.name === cn);
@@ -1192,7 +1504,7 @@ class MotionDBEngine {
       });
       // FK child-reference check / cascade actions when a referenced column value changes
       for (const [otherName, otherTbl] of Object.entries(this.schema)) {
-        if (otherName === '__views__' || !Array.isArray(otherTbl.columns)) continue;
+        if (otherName === '__views__' || !isDbTable(otherTbl)) continue;
         for (const col of otherTbl.columns) {
           if (!col.fk || col.fk.table !== tname) continue;
           const oldVal = row[col.fk.col], newVal = patch[col.fk.col];
@@ -1221,7 +1533,7 @@ class MotionDBEngine {
 
   // ── DELETE ────────────────────────────────────────────────────────────────
 
-  execDelete(stmt) {
+  execDelete(stmt: Extract<SqlStatement, { type: 'DELETE' }>): SqlResult {
     const tname = stmt.table.toLowerCase();
     const tbl = this.getTable(tname);
     const before = tbl.rows.length;
@@ -1233,7 +1545,7 @@ class MotionDBEngine {
     // Enforce referential integrity / apply cascade actions for each row being deleted
     for (const row of toDelete) {
       for (const [otherName, otherTbl] of Object.entries(this.schema)) {
-        if (otherName === '__views__' || !Array.isArray(otherTbl.columns)) continue;
+        if (otherName === '__views__' || !isDbTable(otherTbl)) continue;
         for (const col of otherTbl.columns) {
           if (!col.fk || col.fk.table !== tname) continue;
           const pkVal = row[col.fk.col];
@@ -1248,7 +1560,7 @@ class MotionDBEngine {
               for (const cr of childRows) {
                 this.execDelete({
                   type: 'DELETE', table: otherName,
-                  where: { type: 'BINOP', op: '=', left: { type: 'COL', table: null, col: childPkCol.name }, right: { type: 'LIT', value: cr[childPkCol.name] } }
+                  where: { type: 'BINOP', op: '=', left: { type: 'COL', table: null, col: childPkCol.name }, right: { type: 'LIT', value: this.requireSqlScalar(cr[childPkCol.name]) } }
                 });
               }
             } else {
@@ -1278,9 +1590,9 @@ class MotionDBEngine {
 
   // ── SELECT ────────────────────────────────────────────────────────────────
 
-  execSelect(stmt, outerCtx) {
+  execSelect(stmt: SelectStatement, outerCtx?: EvalRow): RowsResult {
     // Build working set from FROM + JOINs
-    let rows = this.buildFromRows(stmt);
+    let rows: EvalRow[] = this.buildFromRows(stmt);
 
     // Attach the outer row context (for correlated subqueries) so COL lookups
     // inside this query can fall through to the enclosing query's scope.
@@ -1290,7 +1602,7 @@ class MotionDBEngine {
     if (stmt.where) rows = rows.filter(r => this.toBool(this.evalExpr(stmt.where, r)));
 
     // GROUP BY / aggregates
-    const hasAgg = stmt.columns.some(c => c.type !== 'STAR' && this.hasAggregate(c.expr));
+    const hasAgg = stmt.columns.some(c => isSelectExpressionColumn(c) && this.hasAggregate(c.expr));
     if (stmt.groupBy?.length || hasAgg) {
       rows = this.execGroupBy(stmt, rows);
     } else {
@@ -1302,7 +1614,8 @@ class MotionDBEngine {
           for (const o of stmt.orderBy) {
             let oexpr = o.expr;
             if (oexpr.type === 'COL' && !oexpr.table) {
-              const matched = stmt.columns.find(c => c.alias && c.alias.toLowerCase() === oexpr.col.toLowerCase());
+              const columnName = oexpr.col.toLowerCase();
+              const matched = stmt.columns.filter(isSelectExpressionColumn).find(c => c.alias?.toLowerCase() === columnName);
               if (matched) oexpr = matched.expr;
             }
             const va = this.evalExpr(oexpr, a), vb = this.evalExpr(oexpr, b);
@@ -1314,21 +1627,25 @@ class MotionDBEngine {
       }
       // Now project
       rows = rows.map(ctx => {
-        const out = {};
+        const out: DbRow = {};
         stmt.columns.forEach(c => {
-          if (c.type === 'STAR') { Object.assign(out, this.flatCtx(ctx)); }
-          else { const key = c.alias || this.exprName(c.expr); out[key] = this.evalExpr(c.expr, ctx); }
+          if (isSelectExpressionColumn(c)) {
+            const key = c.alias || this.exprName(c.expr);
+            out[key] = this.evalExpr(c.expr, ctx);
+          } else {
+            Object.assign(out, this.flatCtx(ctx));
+          }
         });
         return out;
       });
     }
 
     // HAVING — re-evaluate aggregates using stored group rows
-    if (stmt.having) rows = rows.filter(r => this.toBool(this.evalExpr(stmt.having, r.__grp__ ? r.__grp__[0] : r, r.__grp__ || null)));
+    if (stmt.having) rows = rows.filter(r => this.toBool(this.evalExpr(stmt.having, r.__grp__?.[0] ?? r, r.__grp__)));
 
     // Strip __grp__ and build an alias-augmented row so ORDER BY by alias or expression works.
     if (stmt.groupBy?.length || hasAgg) {
-      const nonStarCols = stmt.columns.filter(c => c.type !== 'STAR');
+      const nonStarCols = stmt.columns.filter(isSelectExpressionColumn);
       rows = rows.map(r => {
         const { __grp__, ...rest } = r;
         // Add alias keys alongside positional keys so ORDER BY `alias` resolves.
@@ -1345,8 +1662,8 @@ class MotionDBEngine {
     // Resolve ORDER BY expressions against the already-computed __col_N__ slots instead —
     // by alias first, then by structural match against the SELECT expression itself.
     if ((stmt.groupBy?.length || hasAgg) && stmt.orderBy?.length) {
-      const nonStarCols = stmt.columns.filter(c => c.type !== 'STAR');
-      const resolveAggOrderVal = (expr, row) => {
+      const nonStarCols = stmt.columns.filter(isSelectExpressionColumn);
+      const resolveAggOrderVal = (expr: SqlExpr, row: DbRow): unknown => {
         if (expr.type === 'COL' && !expr.table) {
           const i = nonStarCols.findIndex(c => c.alias && c.alias.toLowerCase() === expr.col.toLowerCase());
           if (i !== -1) return row[`__col_${i}__`];
@@ -1382,8 +1699,8 @@ class MotionDBEngine {
     // Rows from execGroupBy use positional __col_N__ keys — use index-based extraction
     // to avoid collisions when two columns share the same generated name (e.g. two
     // unaliased COALESCE or SUM(CASE WHEN...) expressions).
-    const usePositional = rows.length > 0 && Object.prototype.hasOwnProperty.call(rows[0], '__col_0__');
-    let result = {
+    const usePositional = rows.length > 0 && '__col_0__' in rows[0];
+    let result: Extract<SqlResult, { type: 'rows' }> = {
       type: 'rows', columns, rows: rows.map(r =>
         usePositional
           ? columns.map((_, i) => r[`__col_${i}__`] ?? null)
@@ -1394,16 +1711,17 @@ class MotionDBEngine {
     // UNION / INTERSECT / EXCEPT
     if (stmt.compound) {
       const right = this.execSelect(stmt.compound.right);
+      if (right.type !== 'rows') throw new Error('A compound SELECT must return rows.');
       const lRows = result.rows;
       const rRows = right.rows;
       // Fast row key — null-byte separated, \x01 sentinel for null values
-      const rowKey = r => r.map(v => v === null ? '\x01' : String(v)).join('\x00');
+      const rowKey = (row: unknown[]): string => row.map(v => v === null ? '\x01' : toDisplayString(v)).join('\x00');
       if (stmt.compound.op === 'UNION') {
         const combined = [...lRows, ...rRows];
         if (stmt.compound.all) {
           result.rows = combined;
         } else {
-          const seen = new Set();
+    const seen = new Set<string>();
           result.rows = combined.filter(r => { const k = rowKey(r); if (seen.has(k)) return false; seen.add(k); return true; });
         }
       } else if (stmt.compound.op === 'INTERSECT') {
@@ -1423,7 +1741,7 @@ class MotionDBEngine {
   // so third+ joins in a chain can still match their ON clause against any earlier
   // table). Returns [{leftAlias, leftCol, rightCol}] for every a.x = b.y pair, or
   // null if the expression isn't a pure equality / AND-of-equalities.
-  _extractEquiKeys(expr, leftAliases, rightAlias) {
+  _extractEquiKeys(expr: SqlExpr | null, leftAliases: Set<string>, rightAlias: string): EquiJoinKey[] | null {
     if (!expr) return null;
     if (expr.type === 'BINOP' && expr.op === 'AND') {
       const l = this._extractEquiKeys(expr.left, leftAliases, rightAlias);
@@ -1455,7 +1773,7 @@ class MotionDBEngine {
 
   // Resolve a FROM/JOIN reference into a table-like {columns,rows} object.
   // Handles plain table/view names as well as derived tables: (SELECT ...) alias.
-  _resolveFromRef(ref) {
+  _resolveFromRef(ref: FromRef): DbTable {
     if (ref.subquery) {
       const result = this.execSelect(ref.subquery);
       const cols = result.columns.map(c => ({ name: c, type: 'TEXT', pk: false, ai: false, notNull: false, unique: false, default: undefined, fk: null }));
@@ -1463,26 +1781,28 @@ class MotionDBEngine {
       return { columns: cols, rows, seq: rows.length, _derived: true };
     }
     // FROM clauses use `name`, JOIN clauses use `table` — accept either.
-    return this.getTable(ref.name ?? ref.table);
+    const tableName = ref.name ?? ref.table;
+    if (typeof tableName !== 'string') throw new Error('A table name is required for this query reference.');
+    return this.getTable(tableName);
   }
 
-  buildFromRows(stmt) {
-    const tname = stmt.from.subquery ? null : stmt.from.name.toLowerCase();
+  buildFromRows(stmt: SelectStatement): EvalRow[] {
+    const tname = !stmt.from.subquery && typeof stmt.from.name === 'string' ? stmt.from.name.toLowerCase() : null;
     const alias = stmt.from.alias?.toLowerCase() || tname;
     if (!alias) throw new Error('Derived table in FROM clause must have an alias');
     const tbl = this._resolveFromRef(stmt.from);
-    let rows = tbl.rows.map(r => ({ [alias]: r }));
+    let rows: EvalRow[] = tbl.rows.map(r => ({ [alias]: r }));
     // Track alias -> table def so RIGHT/FULL JOIN can build correctly-shaped null rows
     // for the left side even when tables are referenced by alias, not real name.
-    const aliasTables = { [alias]: tbl };
+    const aliasTables: Record<string, DbTable> = { [alias]: tbl };
 
     for (const join of stmt.joins || []) {
-      const jname = join.subquery ? null : join.table.toLowerCase();
+      const jname = !join.subquery && typeof join.table === 'string' ? join.table.toLowerCase() : null;
       const jalias = join.alias?.toLowerCase() || jname;
       if (!jalias) throw new Error('Derived table in JOIN must have an alias');
       const jtbl = this._resolveFromRef(join);
       aliasTables[jalias] = jtbl;
-      const result = [];
+      const result: EvalRow[] = [];
 
       // Try hash join for equi-join conditions (dramatically faster than nested loop).
       // leftAliases covers every table joined so far (not just the first one) so
@@ -1494,15 +1814,19 @@ class MotionDBEngine {
 
       if (equiKeys && equiKeys.length && join.kind === 'INNER') {
         // Build hash map on right (join) table
-        const hmap = new Map();
+        const hmap = new Map<string, DbRow[]>();
         for (const r of jtbl.rows) {
           const key = equiKeys.map(k => r[k.rightCol] ?? '\x01null').join('\x00');
           if (!hmap.has(key)) hmap.set(key, []);
-          hmap.get(key).push(r);
+          hmap.get(key)?.push(r);
         }
         for (const l of rows) {
-          const key = equiKeys.map(k => l[k.leftAlias]?.[k.leftCol] ?? '\x01null').join('\x00');
-          const matches = hmap.get(key) || [];
+          const key = equiKeys.map(k => {
+            const leftTable = l[k.leftAlias];
+            const value = isRecord(leftTable) ? leftTable[k.leftCol] : undefined;
+            return value === null || value === undefined ? '\x01null' : String(value);
+          }).join('\x00');
+          const matches = hmap.get(key) ?? [];
           // Verify any non-equi parts of the ON condition
           for (const r of matches) {
             const ctx = { ...l, [jalias]: r };
@@ -1511,15 +1835,19 @@ class MotionDBEngine {
         }
       } else if (equiKeys && equiKeys.length && join.kind === 'LEFT') {
         // Hash left join
-        const hmap = new Map();
+        const hmap = new Map<string, DbRow[]>();
         for (const r of jtbl.rows) {
           const key = equiKeys.map(k => r[k.rightCol] ?? '\x01null').join('\x00');
           if (!hmap.has(key)) hmap.set(key, []);
-          hmap.get(key).push(r);
+          hmap.get(key)?.push(r);
         }
         for (const l of rows) {
-          const key = equiKeys.map(k => l[k.leftAlias]?.[k.leftCol] ?? '\x01null').join('\x00');
-          const candidates = hmap.get(key) || [];
+          const key = equiKeys.map(k => {
+            const leftTable = l[k.leftAlias];
+            const value = isRecord(leftTable) ? leftTable[k.leftCol] : undefined;
+            return value === null || value === undefined ? '\x01null' : String(value);
+          }).join('\x00');
+          const candidates = hmap.get(key) ?? [];
           const matches = candidates.filter(r => this.toBool(this.evalExpr(join.on, { ...l, [jalias]: r })));
           if (matches.length) matches.forEach(r => result.push({ ...l, [jalias]: r }));
           else result.push({ ...l, [jalias]: this.nullRow(jtbl) });
@@ -1537,13 +1865,16 @@ class MotionDBEngine {
           const matches = rows.filter(l => this.toBool(this.evalExpr(join.on, { ...l, [jalias]: r })));
           if (matches.length) matches.forEach(l => result.push({ ...l, [jalias]: r }));
           else {
-            const nullLeft = {};
-            for (const k of Object.keys(rows[0] || {})) nullLeft[k] = this.nullRow(aliasTables[k] || { columns: [] });
+            const nullLeft: Record<string, unknown> = {};
+            for (const k of Object.keys(rows[0] || {})) {
+              const leftTable = aliasTables[k];
+              if (leftTable) nullLeft[k] = this.nullRow(leftTable);
+            }
             result.push({ ...nullLeft, [jalias]: r });
           }
         }
       } else if (join.kind === 'FULL') {
-        const matchedRight = new Set();
+        const matchedRight = new Set<number>();
         for (const l of rows) {
           const matches = jtbl.rows.filter((r, ri) => { const m = this.toBool(this.evalExpr(join.on, { ...l, [jalias]: r })); if (m) matchedRight.add(ri); return m; });
           if (matches.length) matches.forEach(r => result.push({ ...l, [jalias]: r }));
@@ -1551,8 +1882,11 @@ class MotionDBEngine {
         }
         jtbl.rows.forEach((r, ri) => {
           if (!matchedRight.has(ri)) {
-            const nullLeft = {};
-            for (const k of Object.keys(rows[0] || {})) nullLeft[k] = this.nullRow(aliasTables[k] || { columns: [] });
+            const nullLeft: Record<string, unknown> = {};
+            for (const k of Object.keys(rows[0] || {})) {
+              const leftTable = aliasTables[k];
+              if (leftTable) nullLeft[k] = this.nullRow(leftTable);
+            }
             result.push({ ...nullLeft, [jalias]: r });
           }
         });
@@ -1568,8 +1902,8 @@ class MotionDBEngine {
     return rows;
   }
 
-  execGroupBy(stmt, rows) {
-    const groups = new Map();
+  execGroupBy(stmt: SelectStatement, rows: EvalRow[]): EvalRow[] {
+    const groups = new Map<string, EvalRow[]>();
     const sep = '\x00';
     // GROUP BY grp where `grp` is a SELECT ... AS grp alias must group by that
     // column's source expression (e.g. a CASE/computed column), not by a literal
@@ -1577,7 +1911,8 @@ class MotionDBEngine {
     // resolution ORDER BY already does elsewhere in this file.
     const resolvedGroupBy = (stmt.groupBy || []).map(e => {
       if (e.type === 'COL' && !e.table) {
-        const matched = stmt.columns.find(c => c.alias && c.alias.toLowerCase() === e.col.toLowerCase());
+        const columnName = e.col.toLowerCase();
+        const matched = stmt.columns.filter(isSelectExpressionColumn).find(c => c.alias?.toLowerCase() === columnName);
         if (matched) return matched.expr;
       }
       return e;
@@ -1591,13 +1926,13 @@ class MotionDBEngine {
       groups.get(key).push(ctx);
     });
     if (!groups.size && (stmt.groupBy?.length === 0)) groups.set('', rows);
-    const nonStarCols = stmt.columns.filter(c => c.type !== 'STAR');
-    const out = [];
+    const nonStarCols = stmt.columns.filter(isSelectExpressionColumn);
+    const out: EvalRow[] = [];
     groups.forEach(grpRows => {
       // Use positional keys (__col_0__, __col_1__, ...) to prevent collisions when
       // two columns share the same generated name (e.g. two COALESCE expressions
       // or two SUM(CASE WHEN ...) columns without aliases).
-      const row = {};
+      const row: EvalRow = {};
       nonStarCols.forEach((c, i) => {
         row[`__col_${i}__`] = this.evalExpr(c.expr, grpRows[0], grpRows);
       });
@@ -1607,14 +1942,17 @@ class MotionDBEngine {
     return out;
   }
 
-  resultColumns(colDefs, sampleRow, tblName) {
-    const nonStar = colDefs.filter(c => c.type !== 'STAR');
+  resultColumns(colDefs: SelectColumn[], sampleRow?: Record<string, unknown>, tblName?: string | null): string[] {
+    const nonStar = colDefs.filter(isSelectExpressionColumn);
     if (sampleRow) {
       if (colDefs.length === 1 && colDefs[0].type === 'STAR') return Object.keys(sampleRow);
       return nonStar.map(c => c.alias || this.exprName(c.expr));
     }
     if (colDefs.length === 1 && colDefs[0].type === 'STAR') {
-      if (tblName && this.schema[tblName]) return this.schema[tblName].columns.map(c => c.name);
+      if (tblName) {
+        const table = this.schema[tblName];
+        if (isDbTable(table)) return table.columns.map(c => c.name);
+      }
       return [];
     }
     return nonStar.map(c => c.alias || this.exprName(c.expr));
@@ -1622,20 +1960,20 @@ class MotionDBEngine {
 
   // ── SHOW / DESCRIBE / PRAGMA ──────────────────────────────────────────────
 
-  execShowTables() {
+  execShowTables(): SqlResult {
     const tables = Object.keys(this.schema).filter(n => n !== '__views__');
     const views = Object.keys(this.schema.__views__ || {});
     const rows = [...tables.map(n => [n, 'TABLE']), ...views.map(n => [n, 'VIEW'])];
     return { type: 'rows', columns: ['Name', 'Type'], rows };
   }
 
-  execShowIndexes(tname) {
+  execShowIndexes(tname: string): SqlResult {
     const tbl = this.getTable(tname);
     const rows = Object.entries(tbl.indexes || {}).map(([name, idx]) => [name, idx.cols.join(','), idx.unique ? 'YES' : 'NO']);
     return { type: 'rows', columns: ['Index', 'Columns', 'Unique'], rows };
   }
 
-  execDescribe(stmt) {
+  execDescribe(stmt: Extract<SqlStatement, { type: 'DESCRIBE' }>): SqlResult {
     const tbl = this.getTable(stmt.table);
     const columns = ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'];
     const rows = tbl.columns.map(c => [
@@ -1648,7 +1986,7 @@ class MotionDBEngine {
     return { type: 'rows', columns, rows };
   }
 
-  execPragma(stmt) {
+  execPragma(stmt: Extract<SqlStatement, { type: 'PRAGMA' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     if (name === 'table_info') {
       const tbl = this.getTable(stmt.arg);
@@ -1667,14 +2005,14 @@ class MotionDBEngine {
 
   // ── Constraint enforcement ────────────────────────────────────────────────
 
-  enforceUniqueIndex(tbl, row, oldRow, index) {
+  enforceUniqueIndex(tbl: DbTable, row: DbRow, oldRow: DbRow | null, index: IndexDefinition) {
     // SQL UNIQUE permits multiple tuples containing NULL.
     if (index.cols.some(c => row[c] === null || row[c] === undefined)) return;
     if (tbl.rows.some(r => r !== oldRow && index.cols.every(c => r[c] === row[c])))
       throw new Error(`UNIQUE constraint failed: '${index.cols.join(', ')}'`);
   }
 
-  enforceConstraints(tbl, row, oldRow) {
+  enforceConstraints(tbl: DbTable, row: DbRow, oldRow: DbRow | null) {
     for (const index of Object.values(tbl.indexes || {})) {
       if (index.unique) this.enforceUniqueIndex(tbl, row, oldRow, index);
     }
@@ -1688,7 +2026,7 @@ class MotionDBEngine {
       }
       if (col.fk && val !== null && val !== undefined) {
         const ref = this.schema[col.fk.table];
-        if (ref && !ref.rows.find(r => r[col.fk.col] === val))
+        if (isDbTable(ref) && !ref.rows.find(r => r[col.fk.col] === val))
           throw new Error(`FOREIGN KEY constraint failed: '${col.name}' references ${col.fk.table}(${col.fk.col})`);
       }
     }
@@ -1696,7 +2034,7 @@ class MotionDBEngine {
 
   // ── Expression evaluator ──────────────────────────────────────────────────
 
-  evalExpr(expr, ctx, groupRows) {
+  evalExpr(expr: SqlExpr, ctx: EvalRow, groupRows?: EvalRow[]): unknown {
     if (!expr) return null;
     switch (expr.type) {
       case 'LIT': return expr.value;
@@ -1705,19 +2043,21 @@ class MotionDBEngine {
         const col = expr.col.toLowerCase();
         // Walk from the current scope outward through __outer__ (set by correlated
         // subquery evaluation) so inner scopes shadow outer scopes, matching SQL rules.
-        let c = ctx;
+        let c: EvalRow | null = ctx;
         while (c) {
           if (tbl) {
-            if (c[tbl] !== undefined) return c[tbl][col] ?? null;
+            const tableRow = c[tbl];
+            if (isRecord(tableRow)) return tableRow[col] ?? null;
           } else {
             for (const k of Object.keys(c)) {
               if (k === '__outer__') continue;
-              if (c[k] && typeof c[k] === 'object' && col in c[k]) return c[k][col];
+              const tableRow = c[k];
+              if (isRecord(tableRow) && col in tableRow) return tableRow[col];
             }
             // Flat ctx (post-projection rows)
             if (col in c) return c[col] ?? null;
           }
-          c = c.__outer__;
+          c = c.__outer__ ?? null;
         }
         return null;
       }
@@ -1787,7 +2127,7 @@ class MotionDBEngine {
     }
   }
 
-  evalBinop(expr, ctx, groupRows) {
+  evalBinop(expr: Extract<SqlExpr, { type: 'BINOP' }>, ctx: EvalRow, groupRows?: EvalRow[]): unknown {
     // Preserve UNKNOWN while retaining short-circuit evaluation.
     if (expr.op === 'AND' || expr.op === 'OR') {
       const l = this.evalExpr(expr.left, ctx, groupRows);
@@ -1821,7 +2161,7 @@ class MotionDBEngine {
     }
   }
 
-  evalAgg(expr, ctx, groupRows) {
+  evalAgg(expr: Extract<SqlExpr, { type: 'AGG' }>, ctx: EvalRow, groupRows: EvalRow[] = []): unknown {
     if (!groupRows) return null;
     // Pass the per-row context WITH groupRows so nested CASE WHEN inside an aggregate
     // can itself call evalExpr on sub-expressions that need the full groupRows context.
@@ -1829,15 +2169,15 @@ class MotionDBEngine {
     if (expr.distinct) vals = [...new Map(vals.map(v => [JSON.stringify(v), v])).values()];
     switch (expr.fn) {
       case 'COUNT': return expr.arg?.type === 'STAR' ? groupRows.length : vals.length;
-      case 'SUM': return vals.length ? vals.reduce((a, b) => a + this.toNum(b), 0) : null;
-      case 'AVG': return vals.length ? vals.reduce((a, b) => a + this.toNum(b), 0) / vals.length : null;
+      case 'SUM': return vals.length ? vals.reduce<number>((sum, value) => sum + this.toNum(value), 0) : null;
+      case 'AVG': return vals.length ? vals.reduce<number>((sum, value) => sum + this.toNum(value), 0) / vals.length : null;
       case 'MIN': return vals.length ? vals.reduce((a, b) => this.cmp(a, b) < 0 ? a : b) : null;
       case 'MAX': return vals.length ? vals.reduce((a, b) => this.cmp(a, b) > 0 ? a : b) : null;
       default: return null;
     }
   }
 
-  evalFunc(expr, ctx, groupRows) {
+  evalFunc(expr: Extract<SqlExpr, { type: 'FUNC' }>, ctx: EvalRow, groupRows?: EvalRow[]): unknown {
     const args = expr.args.map(a => this.evalExpr(a, ctx, groupRows));
     switch (expr.name.toUpperCase()) {
       case 'UPPER': return String(args[0] ?? '').toUpperCase();
@@ -1849,7 +2189,7 @@ class MotionDBEngine {
       case 'SUBSTR': { const s = String(args[0] ?? ''); const start = Math.max(0, Number(args[1] ?? 1) - 1); return args[2] != null ? s.slice(start, start + Number(args[2])) : s.slice(start); }
       case 'REPLACE': return String(args[0] ?? '').replaceAll(String(args[1] ?? ''), String(args[2] ?? ''));
       case 'ABS': return Math.abs(Number(args[0] ?? 0));
-      case 'ROUND': return Math.round(Number(args[0] ?? 0) * (10 ** (args[1] ?? 0))) / (10 ** (args[1] ?? 0));
+      case 'ROUND': { const places = Number(args[1] ?? 0); return Math.round(Number(args[0] ?? 0) * (10 ** places)) / (10 ** places); }
       case 'FLOOR': return Math.floor(Number(args[0] ?? 0));
       case 'CEIL': return Math.ceil(Number(args[0] ?? 0));
       case 'CEILING': return Math.ceil(Number(args[0] ?? 0));
@@ -1857,8 +2197,8 @@ class MotionDBEngine {
       case 'SQRT': return Math.sqrt(Number(args[0] ?? 0));
       case 'MOD': return Number(args[0] ?? 0) % Number(args[1] ?? 1);
       case 'SIGN': { const n = Number(args[0] ?? 0); return n > 0 ? 1 : n < 0 ? -1 : 0; }
-      case 'GREATEST': return args.reduce((a, b) => this.cmp(a, b) >= 0 ? a : b);
-      case 'LEAST': return args.reduce((a, b) => this.cmp(a, b) <= 0 ? a : b);
+      case 'GREATEST': return args.slice(1).reduce<unknown>((best, value) => this.cmp(best, value) >= 0 ? best : value, args[0] ?? null);
+      case 'LEAST': return args.slice(1).reduce<unknown>((best, value) => this.cmp(best, value) <= 0 ? best : value, args[0] ?? null);
       case 'CONCAT': return args.map(a => a ?? '').join('');
       case 'INSTR': { const s = String(args[0] ?? ''), q = String(args[1] ?? ''); const i = s.indexOf(q); return i === -1 ? 0 : i + 1; }
       case 'LPAD': { const s = String(args[0] ?? ''); const n = Number(args[1] ?? 0); const p = String(args[2] ?? ' '); return s.length >= n ? s : p.repeat(Math.ceil((n - s.length) / p.length)).slice(0, n - s.length) + s; }
@@ -1873,14 +2213,14 @@ class MotionDBEngine {
       case 'NULLIF': return args[0] === args[1] ? null : args[0];
       case 'IIF': case 'IF': return this.toBool(args[0]) ? args[1] : args[2];
       case 'NOW': return new Date().toISOString();
-      case 'DATE': return args[0] ? new Date(args[0]).toISOString().slice(0, 10) : null;
+      case 'DATE': { const date = parseSqlDate(args[0]); return date ? date.toISOString().slice(0, 10) : null; }
       case 'STRFTIME': {
         // strftime(format, date) — support common patterns
         if (!args[1]) return null;
-        const d = new Date(args[1]);
-        if (isNaN(d)) return null;
+        const d = parseSqlDate(args[1]);
+        if (!d) return null;
         const fmt = String(args[0] ?? '');
-        return fmt.replace('%Y', d.getFullYear())
+        return fmt.replace('%Y', String(d.getFullYear()))
           .replace('%m', String(d.getMonth() + 1).padStart(2, '0'))
           .replace('%d', String(d.getDate()).padStart(2, '0'))
           .replace('%H', String(d.getHours()).padStart(2, '0'))
@@ -1889,12 +2229,13 @@ class MotionDBEngine {
       }
       case 'DATE_DIFF': {
         if (!args[0] || !args[1]) return null;
-        const ms = new Date(args[0]) - new Date(args[1]);
-        return Math.floor(ms / 86400000);
+        const first = parseSqlDate(args[0]), second = parseSqlDate(args[1]);
+        return first && second ? Math.floor((first.getTime() - second.getTime()) / 86400000) : null;
       }
       case 'DATE_ADD': case 'DATE_SUB': {
         if (!args[0]) return null;
-        const d = new Date(args[0]);
+        const d = parseSqlDate(args[0]);
+        if (!d) return null;
         const n = Number(args[1] ?? 0) * (expr.name.toUpperCase() === 'DATE_SUB' ? -1 : 1);
         d.setDate(d.getDate() + n);
         return d.toISOString().slice(0, 10);
@@ -1908,16 +2249,17 @@ class MotionDBEngine {
     }
   }
 
-  likeMatch(str, pattern, caseInsensitive = false) {
-    const re = pattern.replace(/[.+*^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.');
-    return new RegExp(`^${re}$`, caseInsensitive ? 'i' : '').test(str);
+  likeMatch(str: unknown, pattern: unknown, caseInsensitive = false): boolean {
+    const re = String(pattern).replace(/[.+*^${}()|[\]\\]/g, '\\$&').replace(/%/g, '.*').replace(/_/g, '.');
+    return new RegExp(`^${re}$`, caseInsensitive ? 'i' : '').test(String(str));
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  getTable(name) {
+  getTable(name: string): DbTable {
     const n = name.toLowerCase();
-    if (this.schema[n]) return this.schema[n];
+    const table = this.schema[n];
+    if (isDbTable(table)) return table;
     // Check if it's a view — materialise it on the fly
     const view = this.schema.__views__?.[n];
     if (view) {
@@ -1929,9 +2271,9 @@ class MotionDBEngine {
     throw new Error(`Table '${n}' does not exist.`);
   }
 
-  rowCtx(alias, row) { return { [alias]: row }; }
+  rowCtx(alias: string, row: DbRow): Record<string, unknown> { return { [alias]: row }; }
 
-  flatCtx(ctx) {
+  flatCtx(ctx: Record<string, unknown>): DbRow {
     const out = {};
     for (const k of Object.keys(ctx)) {
       if (k === '__outer__') continue;
@@ -1940,21 +2282,21 @@ class MotionDBEngine {
     return out;
   }
 
-  nullRow(tbl) {
+  nullRow(tbl: DbTable): DbRow {
     const r = {}; tbl.columns.forEach(c => { r[c.name] = null; }); return r;
   }
 
-  hasAggregate(expr) {
+  hasAggregate(expr: SqlExpr): boolean {
     if (!expr || typeof expr !== 'object') return false;
     if (expr.type === 'AGG') return true;
     return Object.values(expr).some(v => {
-      if (Array.isArray(v)) return v.some(x => this.hasAggregate(x));
-      if (typeof v === 'object' && v) return this.hasAggregate(v);
+      if (Array.isArray(v)) return v.some(x => isSqlExpr(x) && this.hasAggregate(x));
+      if (isSqlExpr(v)) return this.hasAggregate(v);
       return false;
     });
   }
 
-  exprName(expr) {
+  exprName(expr: SqlExpr): string {
     if (expr.type === 'COL') return expr.col;
     if (expr.type === 'AGG') return expr.arg?.type === 'STAR' ? `${expr.fn}(*)` : `${expr.fn}(${this.exprName(expr.arg)})`;
     if (expr.type === 'FUNC') return expr.name;
@@ -1962,10 +2304,14 @@ class MotionDBEngine {
     return 'expr';
   }
 
-  toBool(v) { return v !== null && v !== undefined && v !== false && v !== 0 && v !== ''; }
-  toNum(v) { const n = Number(v); return isNaN(n) ? 0 : n; }
+  toBool(v: unknown): boolean { return v !== null && v !== undefined && v !== false && v !== 0 && v !== ''; }
+  requireSqlScalar(value: unknown): SqlScalar {
+    if (!isSqlScalar(value)) throw new Error('A primary key value must be a SQL scalar.');
+    return value;
+  }
+  toNum(v: unknown): number { const n = Number(v); return isNaN(n) ? 0 : n; }
 
-  cmp(a, b) {
+  cmp(a: unknown, b: unknown): number {
     if (a === b) return 0;
     if (a === null || a === undefined) return 1;
     if (b === null || b === undefined) return -1;
@@ -1975,7 +2321,7 @@ class MotionDBEngine {
 
   // ── VIEW ─────────────────────────────────────────────────────────────────
 
-  execCreateView(stmt) {
+  execCreateView(stmt: Extract<SqlStatement, { type: 'CREATE_VIEW' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     if (!this.schema.__views__) this.schema.__views__ = {};
     if (this.schema.__views__[name]) {
@@ -1986,7 +2332,7 @@ class MotionDBEngine {
     return { type: 'ok', message: `View '${name}' created.` };
   }
 
-  execDropView(stmt) {
+  execDropView(stmt: Extract<SqlStatement, { type: 'DROP_VIEW' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     if (!this.schema.__views__?.[name]) {
       if (stmt.ifExists) return { type: 'ok', message: `View '${name}' does not exist.` };
@@ -1998,7 +2344,7 @@ class MotionDBEngine {
 
   // ── INDEX ─────────────────────────────────────────────────────────────────
 
-  execCreateIndex(stmt) {
+  execCreateIndex(stmt: Extract<SqlStatement, { type: 'CREATE_INDEX' }>): SqlResult {
     const tbl = this.getTable(stmt.table);
     if (!tbl.indexes) tbl.indexes = {};
     if (tbl.indexes[stmt.name]) {
@@ -2015,9 +2361,10 @@ class MotionDBEngine {
     return { type: 'ok', message: `Index '${stmt.name}' created on '${stmt.table}'.` };
   }
 
-  execDropIndex(stmt) {
+  execDropIndex(stmt: Extract<SqlStatement, { type: 'DROP_INDEX' }>): SqlResult {
     for (const tname of Object.keys(this.schema)) {
       const tbl = this.schema[tname];
+      if (!isDbTable(tbl)) continue;
       if (tbl.indexes?.[stmt.name]) {
         delete tbl.indexes[stmt.name];
         return { type: 'ok', message: `Index '${stmt.name}' dropped.` };
@@ -2035,8 +2382,10 @@ class MotionDBEngine {
   //   RELEASE sp     → merge top frame down (commit to parent)
   //   ROLLBACK TO sp → restore to named frame without ending the transaction
 
-  _snapshot() {
-    return JSON.parse(JSON.stringify(this.schema));
+  _snapshot(): DbSchema {
+    const snapshot: unknown = JSON.parse(JSON.stringify(this.schema));
+    if (!isDbSchema(snapshot)) throw new Error('Database schema could not be cloned safely.');
+    return snapshot;
   }
 
   _doRollback() {
@@ -2049,7 +2398,7 @@ class MotionDBEngine {
     this._inTx = false;
   }
 
-  execBegin() {
+  execBegin(): SqlResult {
     if (this._inTx) {
       // Nested BEGIN: treat as an implicit SAVEPOINT rather than silently overwriting
       throw new Error('Cannot BEGIN: a transaction is already active. Use SAVEPOINT for nested transactions.');
@@ -2059,14 +2408,14 @@ class MotionDBEngine {
     return { type: 'ok', message: 'Transaction started.' };
   }
 
-  execCommit() {
+  execCommit(): SqlResult {
     if (!this._inTx) return { type: 'ok', message: 'No active transaction.' };
     this._txStack = [];
     this._inTx = false;
     return { type: 'ok', message: 'Transaction committed.', _committed: true };
   }
 
-  execRollback() {
+  execRollback(): SqlResult {
     if (!this._inTx) return { type: 'ok', message: 'No active transaction.' };
     // Restore to the outermost BEGIN snapshot
     this.schema = this._txStack[0].snapshot;
@@ -2075,7 +2424,7 @@ class MotionDBEngine {
     return { type: 'ok', message: 'Transaction rolled back.', _rolledBack: true };
   }
 
-  execSavepoint(stmt) {
+  execSavepoint(stmt: Extract<SqlStatement, { type: 'SAVEPOINT' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     if (!this._inTx) {
       // Auto-begin if not already in a transaction (matches SQLite behaviour)
@@ -2088,7 +2437,7 @@ class MotionDBEngine {
     return { type: 'ok', message: `Savepoint '${name}' set.` };
   }
 
-  execRelease(stmt) {
+  execRelease(stmt: Extract<SqlStatement, { type: 'RELEASE' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     const idx = this._txStack.findIndex(f => f.name === name);
     if (idx === -1) throw new Error(`Savepoint '${name}' does not exist.`);
@@ -2099,13 +2448,15 @@ class MotionDBEngine {
     return { type: 'ok', message: `Savepoint '${name}' released.` };
   }
 
-  execRollbackTo(stmt) {
+  execRollbackTo(stmt: Extract<SqlStatement, { type: 'ROLLBACK_TO' }>): SqlResult {
     const name = stmt.name.toLowerCase();
     const idx = this._txStack.findIndex(f => f.name === name);
     if (idx === -1) throw new Error(`Savepoint '${name}' does not exist.`);
     // Restore schema to that savepoint's snapshot but keep the frame —
     // the transaction is still open, further statements can follow
-    this.schema = JSON.parse(JSON.stringify(this._txStack[idx].snapshot));
+    const snapshot: unknown = JSON.parse(JSON.stringify(this._txStack[idx].snapshot));
+    if (!isDbSchema(snapshot)) throw new Error('Savepoint schema could not be restored safely.');
+    this.schema = snapshot;
     // Drop all frames above this one (they are invalidated)
     this._txStack.splice(idx + 1);
     return { type: 'ok', message: `Rolled back to savepoint '${name}'.` };
@@ -2113,9 +2464,9 @@ class MotionDBEngine {
 
   // ── EXPLAIN ───────────────────────────────────────────────────────────────
 
-  execExplain(stmt) {
+  execExplain(stmt: Extract<SqlStatement, { type: 'EXPLAIN' }>): SqlResult {
     const inner = stmt.stmt;
-    const lines = [];
+    const lines: string[][] = [];
     lines.push(['Step', 'Operation', 'Detail']);
     if (inner.type === 'SELECT') {
       lines.push(['1', 'SCAN', `Table: ${inner.from?.name || '?'}`]);
@@ -2132,19 +2483,19 @@ class MotionDBEngine {
 
   // ── WITH (CTE) ────────────────────────────────────────────────────────────
 
-  execWith(stmt) {
+  execWith(stmt: Extract<SqlStatement, { type: 'WITH' }>): SqlResult {
     // CTE names shadow persisted tables only for the duration of this query.
-    const originals = new Map();
+    const originals = new Map<string, { exists: boolean; value: DbSchema[string] }>();
     try {
       for (const cte of stmt.ctes) {
         const name = cte.name.toLowerCase();
         const result = this.execSelect(cte.query);
         if (!originals.has(name)) originals.set(name, {
-          exists: Object.prototype.hasOwnProperty.call(this.schema, name),
+          exists: Object.keys(this.schema).includes(name),
           value: this.schema[name],
         });
-        const cols = result.columns.map(c => ({ name: c, type: 'TEXT', pk: false, ai: false, notNull: false, unique: false, fk: null }));
-        const rows = result.rows.map(row => Object.fromEntries(result.columns.map((c, i) => [c, row[i]])));
+        const cols: DbColumn[] = result.columns.map(c => ({ name: c, type: 'TEXT', pk: false, ai: false, notNull: false, unique: false, fk: null }));
+        const rows: DbRow[] = result.rows.map(row => Object.fromEntries(result.columns.map((c, i) => [c, row[i]])));
         this.schema[name] = { columns: cols, rows, seq: rows.length, _temp: true };
       }
       return this.execStmt(stmt.stmt);
@@ -2158,8 +2509,13 @@ class MotionDBEngine {
 
   // ── Serialize / deserialize ───────────────────────────────────────────────
 
-  serialize() { return JSON.stringify(this.schema); }
-  deserialize(s) { this.schema = JSON.parse(s); }
+  serialize(): string { return JSON.stringify(this.schema); }
+  deserialize(serialized: string): void {
+    const schema: unknown = JSON.parse(serialized);
+    if (!isDbSchema(schema)) throw new Error('Database file has an invalid schema.');
+    normalizeLegacySelectColumnTags(schema);
+    this.schema = schema;
+  }
 }
 
 function toDisplayString(value: unknown, nullishAsEmpty = false): string {
@@ -2167,15 +2523,13 @@ function toDisplayString(value: unknown, nullishAsEmpty = false): string {
   if (value === undefined) return nullishAsEmpty ? '' : 'undefined';
   if (Array.isArray(value)) return value.join(',');
   if (value instanceof Date) return value.toString();
-  if (typeof value === 'object') return Object.prototype.toString.call(value);
-  if (typeof value === 'function') return Function.prototype.toString.call(value);
-  if (typeof value === 'symbol') return Symbol.prototype.toString.call(value);
+  if (typeof value === 'object' || typeof value === 'function' || typeof value === 'symbol') return String(value);
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
   return 'undefined';
 }
 
-function toSqlLiteral(value) {
+function toSqlLiteral(value: unknown): string {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
   if (typeof value === 'number') {
@@ -2187,7 +2541,7 @@ function toSqlLiteral(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function bindParameters(sql, parameters = []) {
+function bindParameters(sql: string, parameters: unknown[] = []): string {
   if (!sql.includes('$')) return sql;
   let output = '';
   let quote = null;
@@ -2254,7 +2608,7 @@ function bindParameters(sql, parameters = []) {
   return output;
 }
 
-function isReadOnlyStatement(stmt) {
+function isReadOnlyStatement(stmt: SqlStatement | undefined): boolean {
   if (!stmt) return false;
   if (['SELECT', 'SHOW_TABLES', 'SHOW_DATABASES', 'DESCRIBE', 'PRAGMA', 'EXPLAIN'].includes(stmt.type)) return true;
   return stmt.type === 'WITH'
@@ -2262,16 +2616,25 @@ function isReadOnlyStatement(stmt) {
     && isReadOnlyStatement(stmt.stmt);
 }
 
-function assertReadOnlyQuery(sql) {
+function assertReadOnlyQuery(sql: string): void {
   const statements = new Parser(tokenize(sql)).parse();
   if (statements.length !== 1 || !isReadOnlyStatement(statements[0])) {
     throw new Error('Embedded and Bases queries must contain one read-only statement.');
   }
 }
 
-function parseMotionDBEmbedSource(source) {
+interface MotionDBEmbedConfig {
+  database: string;
+  table: string;
+  sql: string;
+  limit: number | null;
+  interactive: boolean;
+  properties: PropertyFormats;
+}
+
+function parseMotionDBEmbedSource(source: string): MotionDBEmbedConfig {
   const lines = String(source ?? '').trim().split(/\r?\n/);
-  const options = {};
+  const options: Record<string, string> = {};
   let sqlStart = lines.length;
 
   for (let index = 0; index < lines.length; index++) {
@@ -2294,7 +2657,7 @@ function parseMotionDBEmbedSource(source) {
   if (table && sql) throw new Error('Use either “table:” or a SQL query in a Motion Database embed, not both.');
   if (!table && !sql) throw new Error('Add “table: Table name” or a read-only SQL query to the embed.');
 
-  let limit = null;
+  let limit: number | null = null;
   if (options.limit !== undefined) {
     if (!table) throw new Error('The “limit:” option can only be used with “table:”. Use SQL LIMIT for queries.');
     if (!/^[1-9]\d*$/.test(options.limit)) throw new Error('The embed limit must be a positive whole number.');
@@ -2316,8 +2679,8 @@ function parseMotionDBEmbedSource(source) {
   return { database, table, sql, limit, interactive, properties };
 }
 
-function parseEmbedPropertyFormats(source) {
-  const formats = {};
+function parseEmbedPropertyFormats(source: string): PropertyFormats {
+  const formats: PropertyFormats = {};
   if (!String(source || '').trim()) return formats;
 
   String(source).split(';').forEach(entry => {
@@ -2329,22 +2692,28 @@ function parseEmbedPropertyFormats(source) {
     const declaration = entry.slice(separator + 1).trim().toLowerCase();
     if (!column || !declaration) throw new Error('Embed property columns and types cannot be blank.');
 
-    let format = null;
-    if (['text', 'image', 'media', 'checkbox'].includes(declaration)) {
+    let format: PropertyFormat | null = null;
+    if (declaration === 'text' || declaration === 'image' || declaration === 'media' || declaration === 'checkbox') {
       format = { type: declaration };
     } else {
       let match = declaration.match(/^progress(?:\(\s*(\d+(?:\.\d+)?)\s*\))?$/);
       if (match) format = { type: 'progress', max: match[1] ? Number(match[1]) : 100 };
       match = match || declaration.match(/^(stars|hearts|number)(?:\(\s*(\d+(?:\.\d+)?)\s*\))?$/);
-      if (!format && match) format = { type: 'rating', style: match[1], max: match[2] ? Number(match[2]) : 5 };
+      const shorthandStyle = match?.[1];
+      if (!format && (shorthandStyle === 'stars' || shorthandStyle === 'hearts' || shorthandStyle === 'number')) {
+        format = { type: 'rating', style: shorthandStyle, max: match?.[2] ? Number(match[2]) : 5 };
+      }
       match = declaration.match(/^rating\(\s*(stars|hearts|number)(?:\s*,\s*(\d+(?:\.\d+)?))?\s*\)$/);
-      if (!format && match) format = { type: 'rating', style: match[1], max: match[2] ? Number(match[2]) : 5 };
+      const explicitStyle = match?.[1];
+      if (!format && (explicitStyle === 'stars' || explicitStyle === 'hearts' || explicitStyle === 'number')) {
+        format = { type: 'rating', style: explicitStyle, max: match?.[2] ? Number(match[2]) : 5 };
+      }
     }
 
     if (!format) {
       throw new Error(`Unknown display type “${declaration}” for “${column}”. Use text, image, media, checkbox, progress(max), or rating(stars|hearts|number, max).`);
     }
-    if (format.max !== undefined && (!Number.isFinite(format.max) || format.max <= 0)) {
+    if ('max' in format && format.max !== undefined && (!Number.isFinite(format.max) || format.max <= 0)) {
       throw new Error(`The maximum for “${column}” must be greater than zero.`);
     }
     formats[column] = format;
@@ -2352,17 +2721,32 @@ function parseEmbedPropertyFormats(source) {
   return formats;
 }
 
-function computeERDLayout(tables, getTable, options = {}) {
+interface ERDPosition { x: number; y: number; w: number; h: number }
+interface ERDLayout {
+  positions: Record<string, ERDPosition>;
+  totalW: number;
+  totalH: number;
+  CARD_W: number;
+  CARD_H_BASE: number;
+  ROW_H: number;
+  GAP_X: number;
+}
+
+function computeERDLayout(
+  tables: string[],
+  getTable: (name: string) => DbTable,
+  options: Partial<{ cardWidth: number; headerHeight: number; rowHeight: number; padding: number; horizontalGap: number; verticalGap: number }> = {},
+): ERDLayout {
   const CARD_W = options.cardWidth || 240;
   const CARD_H_BASE = options.headerHeight || 42;
   const ROW_H = options.rowHeight || 24;
   const PAD = options.padding || 48;
   const GAP_X = options.horizontalGap || 180;
   const GAP_Y = options.verticalGap || 36;
-  const positions = {};
-  const depthMemo = {};
+  const positions: Record<string, ERDPosition> = {};
+  const depthMemo: Record<string, number> = {};
 
-  const getDepth = (tableName, visiting = new Set()) => {
+  const getDepth = (tableName: string, visiting: Set<string> = new Set<string>()): number => {
     if (depthMemo[tableName] !== undefined) return depthMemo[tableName];
     if (visiting.has(tableName)) return 0;
     const nextVisiting = new Set(visiting);
@@ -2378,12 +2762,15 @@ function computeERDLayout(tables, getTable, options = {}) {
   };
 
   const orderedDepths = [...new Set(tables.map(table => getDepth(table)))].sort((a, b) => a - b);
-  const depthColumns = new Map(orderedDepths.map(depth => [depth, []]));
+  const depthColumns = new Map(orderedDepths.map(depth => [depth, [] as string[]]));
   [...tables].sort((a, b) => a.localeCompare(b)).forEach(table => {
-    depthColumns.get(getDepth(table)).push(table);
+    const columnTables = depthColumns.get(getDepth(table));
+    if (!columnTables) throw new Error(`Missing layout column for table '${table}'.`);
+    columnTables.push(table);
   });
   const columnHeights = orderedDepths.map(depth => {
     const columnTables = depthColumns.get(depth);
+    if (!columnTables) throw new Error(`Missing layout column for depth ${depth}.`);
     return columnTables.reduce((height, table) => (
       height + CARD_H_BASE + getTable(table).columns.length * ROW_H
     ), 0) + Math.max(0, columnTables.length - 1) * GAP_Y;
@@ -2392,6 +2779,7 @@ function computeERDLayout(tables, getTable, options = {}) {
 
   orderedDepths.forEach((depth, columnIndex) => {
     const columnTables = depthColumns.get(depth);
+    if (!columnTables) throw new Error(`Missing layout column for depth ${depth}.`);
     let y = PAD + (maxColumnHeight - columnHeights[columnIndex]) / 2;
     const x = PAD + columnIndex * (CARD_W + GAP_X);
     columnTables.forEach(table => {
@@ -2418,7 +2806,7 @@ const VIEW_TYPE = 'motion-database';
 const VIEW_TYPE_HOME = 'motion-database-home';
 const DB_DIR = 'motion-databases';
 
-function setButtonContent(button, icon, label) {
+function setButtonContent(button: HTMLElement, icon: string, label: string): HTMLElement {
   button.empty();
   setIcon(button, icon);
   button.createSpan({ text: label });
@@ -2429,7 +2817,18 @@ function setButtonContent(button, icon, label) {
 // ── Per-database wrapper ───────────────────────────────────────────────────────
 
 class MotionDB {
-  constructor(plugin, filePath) {
+  static _backedUpPaths = new Set<string>();
+  plugin: MotionDatabasePluginAPI;
+  filePath: string;
+  engine: MotionDBEngine;
+  name: string;
+  _saveChain: Promise<void>;
+  _saveTimer: number | null;
+  _directoryReady: boolean;
+  _deleted = false;
+  _loadPromise: Promise<void> | null = null;
+
+  constructor(plugin: MotionDatabasePluginAPI, filePath: string) {
     this.plugin = plugin;
     this.filePath = filePath;
     this.engine = new MotionDBEngine();
@@ -2439,13 +2838,13 @@ class MotionDB {
     this._directoryReady = false;
   }
 
-  nameFromPath() { return this.filePath.split('/').pop().replace(/\.motiondb\.json$/, ''); }
+  nameFromPath(): string { return this.filePath.split('/').pop()?.replace(/\.motiondb\.json$/, '') || 'Untitled'; }
 
   async load() {
     // Never read this instance while one of its writes is still in flight.
     await this._saveChain.catch(() => { });
-    let fileExisted = await this.plugin.app.vault.adapter.exists(this.filePath);
-    let lastErr = null;
+    const fileExisted = await this.plugin.app.vault.adapter.exists(this.filePath);
+    let lastErr: unknown = null;
 
     if (!fileExisted) {
       this.name = this.nameFromPath();
@@ -2463,13 +2862,17 @@ class MotionDB {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const raw = await this.plugin.app.vault.adapter.read(this.filePath);
-        const data = JSON.parse(raw);
-        this.name = data.name || this.nameFromPath();
-        if (data.schema) this.engine.deserialize(JSON.stringify(data.schema));
+        const data: unknown = JSON.parse(raw);
+        if (!isRecord(data)) throw new Error('Database file must contain a JSON object.');
+        this.name = typeof data.name === 'string' && data.name ? data.name : this.nameFromPath();
+        if (data.schema !== undefined) {
+          if (!isDbSchema(data.schema)) throw new Error('Database file has an invalid schema.');
+          this.engine.deserialize(JSON.stringify(data.schema));
+        }
         return; // success
       } catch (e) {
         lastErr = e;
-        if (attempt < 2) await new Promise(r => window.setTimeout(r, 60 * (attempt + 1)));
+        if (attempt < 2) await new Promise<void>(resolve => window.setTimeout(resolve, 60 * (attempt + 1)));
       }
     }
 
@@ -2501,7 +2904,7 @@ class MotionDB {
     }
   }
 
-  async save() {
+  async save(): Promise<void> {
     if (this._deleted) throw new Error(`Database “${this.name}” has been deleted.`);
     // Capture state now, then serialize disk writes for this database so a
     // slower, older save can never overwrite a newer one.
@@ -2546,7 +2949,7 @@ class MotionDB {
     return operation;
   }
 
-  scheduleSave(delay = 90) {
+  scheduleSave(delay = 90): void {
     if (this._deleted || this.engine._inTx || !this.engine._dirty) return;
     if (this._saveTimer) window.clearTimeout(this._saveTimer);
     this._saveTimer = window.setTimeout(() => {
@@ -2555,7 +2958,7 @@ class MotionDB {
     }, delay);
   }
 
-  async flushSave() {
+  async flushSave(): Promise<void> {
     if (this._saveTimer) { window.clearTimeout(this._saveTimer); this._saveTimer = null; }
     if (this._deleted || this.engine._inTx || !this.engine._dirty) return this._saveChain;
     this.engine._dirty = false;
@@ -2570,14 +2973,14 @@ class MotionDB {
     return this._saveChain;
   }
 
-  cancelScheduledSave() {
+  cancelScheduledSave(): void {
     if (this._saveTimer) window.clearTimeout(this._saveTimer);
     this._saveTimer = null;
   }
 
-  exec(sql) { return this.engine.exec(sql); }
+  exec(sql: string): SqlResult[] { return this.engine.exec(sql); }
 
-  async query(sql, parameters = []) {
+  async query(sql: string, parameters: unknown[] = []): Promise<SqlResult[]> {
     const results = this.exec(bindParameters(sql, parameters));
     if (!this.engine._inTx && this.engine._dirty) {
       this.scheduleSave();
@@ -2585,23 +2988,23 @@ class MotionDB {
     return results;
   }
 
-  tables() { return Object.keys(this.engine.schema).filter(k => k !== '__views__'); }
+  tables(): string[] { return Object.keys(this.engine.schema).filter(k => k !== '__views__'); }
 
-  tableData(name) {
+  tableData(name: string): DbTable | null {
     const tbl = this.engine.schema[name.toLowerCase()];
-    if (!tbl) return null;
+    if (!isDbTable(tbl)) return null;
     return tbl;
   }
 }
 
 // ── Global DataviewJS API ─────────────────────────────────────────────────────
 
-function registerGlobalAPI(plugin) {
+function registerGlobalAPI(plugin: MotionDatabasePluginAPI): void {
   window._motionDBRegistry = {};
   // Dashboard/widget embeds often request the same small result set during the
   // same render burst. Share those reads briefly so multiple instances do not
   // repeat parsing, joins, and object materialization on the UI thread.
-  const selectCache = new Map();
+  const selectCache = new Map<string, { expires: number; promise: Promise<DbRow[]> }>();
 
   // ── Sample database SQL (Northwind-style: customers, products, orders, order_items) ──
   const SAMPLE_SQL = `
@@ -2835,14 +3238,14 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
         console.warn('[MotionDB] Fast database lookup failed; trying a full scan:', name, error);
       }
 
-      let files = [];
+      let files: string[] = [];
       try {
         const d = await plugin.app.vault.adapter.list(DB_DIR);
         files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
       } catch (error) {
         console.error('[MotionDB] Could not list database files:', error);
       }
-      let byFilename = null;
+      let byFilename: MotionDB | null = null;
       for (const fp of files) {
         if (fp === guessPath) continue; // already tried above
         const db = await plugin.getDatabase(fp);
@@ -2882,7 +3285,10 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
       if (selectCache.size > 128) {
         const now = Date.now();
         for (const [cacheKey, entry] of selectCache) if (entry.expires <= now) selectCache.delete(cacheKey);
-        if (selectCache.size > 128) selectCache.delete(selectCache.keys().next().value);
+        if (selectCache.size > 128) {
+          const oldestKey = [...selectCache.keys()][0];
+          if (oldestKey !== undefined) selectCache.delete(oldestKey);
+        }
       }
       let cached = selectCache.get(key);
       if (!cached || cached.expires <= Date.now()) {
@@ -2892,7 +3298,7 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
           const result = results[0];
           if (!result || result.type !== 'rows') return [];
           return result.rows.map(row => {
-            const obj = {};
+            const obj: DbRow = {};
             result.columns.forEach((col, i) => { obj[col] = row[i]; });
             return obj;
           });
@@ -2908,7 +3314,7 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
      * List all databases and their tables.
      */
     list: async () => {
-      let files = [];
+      let files: string[] = [];
       try {
         const d = await plugin.app.vault.adapter.list(DB_DIR);
         files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
@@ -2916,7 +3322,7 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
         console.error('[MotionDB] Could not list databases:', error);
         return [];
       }
-      const out = [];
+      const out: Array<{ name: string; tables: string[] }> = [];
       for (const fp of files) {
         const db = await plugin.getDatabase(fp);
         out.push({ name: db.name, tables: db.tables() });
@@ -2941,11 +3347,11 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
       const db = await window.motiondb.open(dbName);
       // Pass the entire SQL block to exec() — it handles multiple statements correctly
       // and doesn't break on semicolons inside string literals (unlike a naive split).
-      let results = [];
+      let results: Array<SqlResult | { type: 'error'; message: string }> = [];
       try {
         results = await db.query(SAMPLE_SQL);
       } catch (e) {
-        results.push({ type: 'error', message: e.message });
+        results.push({ type: 'error', message: errorMessage(e) });
       }
       const ok = results.filter(r => r.type === 'ok').length;
       const errs = results.filter(r => r.type === 'error');
@@ -2964,7 +3370,18 @@ CREATE VIEW IF NOT EXISTS product_revenue AS
 // ── View ──────────────────────────────────────────────────────────────────────
 
 class MotionDatabaseView extends ItemView {
-  constructor(leaf, plugin) {
+  plugin: MotionDatabasePluginAPI;
+  db: MotionDB | null;
+  activeTab: string;
+  sqlHistory: string[];
+  historyIdx: number;
+  sqlOutput: string;
+  sqlOutputBlocks: SqlOutputBlock[];
+  sqlInitial?: string;
+  _saveTimer: number | null;
+  file: { name: string; path: string; extension: string };
+
+  constructor(leaf: WorkspaceLeaf, plugin: MotionDatabasePluginAPI) {
     super(leaf);
     this.plugin = plugin;
     this.db = null;
@@ -2992,10 +3409,10 @@ class MotionDatabaseView extends ItemView {
   // Databases are opened explicitly from the Home view.
   getState() { return {}; }
 
-  async setState(state, result) {
+  async setState(state: unknown, _result: unknown) {
     // Called by Obsidian during same-session tab history navigation only.
     // On startup we return {} from getState so filePath is never in saved state.
-    if (!state?.filePath) return;
+    if (!isRecord(state) || typeof state.filePath !== 'string') return;
     if (state.filePath === this.db?.filePath) return;
     try {
       const exists = await this.plugin.app.vault.adapter.exists(state.filePath);
@@ -3003,7 +3420,7 @@ class MotionDatabaseView extends ItemView {
     } catch { /* ignore */ }
   }
 
-  async loadDB(filePath) {
+  async loadDB(filePath: string): Promise<void> {
     try {
       this.db = await this.plugin.getDatabase(filePath);
       window._motionDBRegistry = window._motionDBRegistry || {};
@@ -3014,7 +3431,7 @@ class MotionDatabaseView extends ItemView {
       this.render();
     } catch (e) {
       console.error('[MotionDB] Failed to load database:', filePath, e);
-      new Notice(`Failed to load database: ${e.message}`, 6000);
+      new Notice(`Failed to load database: ${errorMessage(e)}`, 6000);
       this.db = null;
       this.render();
     }
@@ -3053,7 +3470,8 @@ class MotionDatabaseView extends ItemView {
     const root = this.containerEl;
     root.empty();
 
-    if (!this.db) {
+    const db = this.db;
+    if (!db) {
       // Transient state — view was just created, loadDB is about to be called.
       // Show a neutral placeholder. Do NOT self-destruct here because this runs
       // before openInLeaf has a chance to call loadDB.
@@ -3073,7 +3491,7 @@ class MotionDatabaseView extends ItemView {
     const headerIcon = workspaceHeader.createDiv({ cls: 'mdb-home-logo mdb-workspace-logo' });
     setIcon(headerIcon, 'database');
     const headerIdentity = workspaceHeader.createDiv({ cls: 'mdb-home-title-wrap' });
-    const titleEl = headerIdentity.createSpan({ cls: 'mdb-home-title mdb-workspace-title', text: this.db.name });
+    const titleEl = headerIdentity.createSpan({ cls: 'mdb-home-title mdb-workspace-title', text: db.name });
     headerIdentity.createDiv({ cls: 'mdb-home-subtitle', text: 'Local database' });
     const savedState = workspaceHeader.createDiv({ cls: 'mdb-workspace-status' });
     setIcon(savedState, 'hard-drive');
@@ -3084,7 +3502,7 @@ class MotionDatabaseView extends ItemView {
     titleEl.onblur = () => {
       if (nameBlurHandled) return;
       nameBlurHandled = true;
-      this.db.name = titleEl.textContent.trim() || 'Untitled';
+      db.name = titleEl.textContent.trim() || 'Untitled';
       void this.persistAndRender().catch(error => {
         console.error('[MotionDB] Could not save the database name:', error);
         new Notice('Could not save the database name.');
@@ -3098,7 +3516,7 @@ class MotionDatabaseView extends ItemView {
 
     // Match Obsidian's Settings navigation semantics and visual tokens rather
     // than inheriting the application's regular button treatment.
-    const sidebarItem = (parent, className, onActivate) => {
+    const sidebarItem = (parent: HTMLElement, className: string, onActivate: () => void): HTMLDivElement => {
       const el = parent.createDiv({ cls: `vertical-tab-nav-item ${className}` });
       el.setAttribute('role', 'button');
       el.tabIndex = 0;
@@ -3111,7 +3529,7 @@ class MotionDatabaseView extends ItemView {
       };
       return el;
     };
-    const navItem = (label, icon, id) => {
+    const navItem = (label: string, icon: string, id: string): HTMLDivElement => {
       const el = sidebarItem(sidebar, 'mdb-nav-item' + (this.activeTab === id ? ' is-active' : ''), () => {
         this.activeTab = id;
         this.render();
@@ -3130,7 +3548,7 @@ class MotionDatabaseView extends ItemView {
 
     // New table + Import CSV Settings-style actions
     const newTblBtn = sidebarItem(sidebar, 'mdb-nav-item mdb-sidebar-action', () => {
-      new NewTableModal(this.app, this.db, () => this.persistAndRender()).open();
+      new NewTableModal(this.app, db, () => this.persistAndRender()).open();
     });
     setButtonContent(newTblBtn, 'plus', 'New table');
     const importSideBtn = sidebarItem(sidebar, 'mdb-nav-item mdb-sidebar-action', () => this.importCSV());
@@ -3147,8 +3565,10 @@ class MotionDatabaseView extends ItemView {
 
   // ── Export / Import ────────────────────────────────────────────────────────
 
-  exportCSV(tableName) {
-    const tbl = this.db.tableData(tableName);
+  exportCSV(tableName: string): void {
+    const db = this.db;
+    if (!db) return;
+    const tbl = db.tableData(tableName);
     if (!tbl) return;
     const headers = tbl.columns.map(c => c.name);
     const rows = tbl.rows.map(r => headers.map(h => {
@@ -3160,14 +3580,14 @@ class MotionDatabaseView extends ItemView {
     const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
-    const a = createEl('a');
+    const a = document.createEl('a');
     a.href = url; a.download = `${tableName}.csv`; a.click();
     URL.revokeObjectURL(url);
     new Notice(`Exported ${tbl.rows.length} rows to ${tableName}.csv`);
   }
 
   // ── CSV type inference ────────────────────────────────────────────────────
-  inferCSVType(values) {
+  inferCSVType(values: string[]): 'INTEGER' | 'REAL' | 'TEXT' {
     // Sample up to 50 non-empty values and decide INTEGER / REAL / TEXT
     const samples = values.filter(v => v !== null && v.trim() !== '' && v.trim().toUpperCase() !== 'NULL').slice(0, 50);
     if (!samples.length) return 'TEXT';
@@ -3179,12 +3599,14 @@ class MotionDatabaseView extends ItemView {
   }
 
   // ── Smart CSV import — creates table automatically if needed ───────────────
-  importCSV(tableName = null) {
-    const input = createEl('input');
+  importCSV(tableName: string | null = null): void {
+    const input = document.createEl('input');
     input.type = 'file'; input.accept = '.csv';
-    input.onchange = async (e) => {
-      const file = e.target.files[0];
+    input.onchange = async () => {
+      const file = input.files?.[0];
       if (!file) return;
+      const db = this.db;
+      if (!db) return;
 
       // Normalise line endings
       const text = (await file.text()).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -3201,10 +3623,10 @@ class MotionDatabaseView extends ItemView {
         targetTable = baseName;
 
         // If table already exists, ask user whether to append or replace
-        const existing = this.db.tableData(targetTable);
+        const existing = db.tableData(targetTable);
         if (existing) {
           // Table exists — confirm append; resolve(false) on cancel so we don't hang
-          const confirmed = await new Promise(resolve => {
+          const confirmed = await new Promise<boolean>(resolve => {
             new ConfirmModal(
               this.app,
               `Table "${targetTable}" already exists. Append the CSV data to it?`,
@@ -3224,16 +3646,20 @@ class MotionDatabaseView extends ItemView {
           const createSQL = `CREATE TABLE ${targetTable} (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  ${colDefs}\n)`;
 
           try {
-            this.db.exec(createSQL);
+            db.exec(createSQL);
           } catch (err) {
-            new Notice(`Could not create table "${targetTable}": ${err.message}`, 6000);
+            new Notice(`Could not create table "${targetTable}": ${errorMessage(err)}`, 6000);
             return;
           }
         }
       }
 
       // ── Insert rows ──
-      const tbl = this.db.tableData(targetTable);
+      const tbl = db.tableData(targetTable);
+      if (!tbl) {
+        new Notice(`Table "${targetTable}" could not be loaded after import setup.`, 6000);
+        return;
+      }
       const dbCols = tbl.columns.map(c => c.name);
       // Map CSV headers to matching table columns (skip AI columns)
       const matchedCols = headers.filter(h => dbCols.includes(h) && !tbl.columns.find(c => c.name === h)?.ai);
@@ -3244,7 +3670,7 @@ class MotionDatabaseView extends ItemView {
       }
 
       let imported = 0;
-      const errorList = [];
+      const errorList: Array<{ row: number; message: string }> = [];
       for (let i = 1; i < lines.length; i++) {
         try {
           const vals = this.parseCSVLine(lines[i]);
@@ -3254,10 +3680,10 @@ class MotionDatabaseView extends ItemView {
             if (v === undefined || v === null || v.trim() === '' || v.trim().toUpperCase() === 'NULL') return 'NULL';
             return `'${v.replace(/'/g, "''")}'`;
           }).join(', ');
-          this.db.exec(`INSERT INTO ${targetTable} (${sqlCols}) VALUES (${sqlVals})`);
+          db.exec(`INSERT INTO ${targetTable} (${sqlCols}) VALUES (${sqlVals})`);
           imported++;
         } catch (err) {
-          errorList.push({ row: i + 1, message: err.message });
+          errorList.push({ row: i + 1, message: errorMessage(err) });
         }
       }
 
@@ -3284,8 +3710,8 @@ class MotionDatabaseView extends ItemView {
     input.click();
   }
 
-  parseCSVLine(line) {
-    const result = []; let cur = ''; let inQuote = false;
+  parseCSVLine(line: string): string[] {
+    const result: string[] = []; let cur = ''; let inQuote = false;
     for (let i = 0; i < line.length; i++) {
       if (line[i] === '"') {
         if (inQuote && line[i + 1] === '"') { cur += '"'; i++; }
@@ -3302,18 +3728,19 @@ class MotionDatabaseView extends ItemView {
 
   // ── Dashboard ──────────────────────────────────────────────────────────────
 
-  renderDashboard(el) {
+  renderDashboard(el: HTMLElement): void {
     const hdr = el.createDiv({ cls: 'mdb-content-hdr' });
     hdr.createEl('h2', { cls: 'mdb-content-title', text: 'Overview' });
 
     const d = this.db;
+    if (!d) return;
     const tables = d.tables();
     const totalRows = tables.reduce((s, t) => (s + (d.tableData(t)?.rows?.length || 0)), 0);
     const views = Object.keys(d.engine.schema.__views__ || {});
 
     // Stats cards
     const cards = el.createDiv({ cls: 'mdb-dash-cards' });
-    const card = (icon, val, label) => {
+    const card = (icon: string, val: string | number, label: string): void => {
       const c = cards.createDiv({ cls: 'mdb-dash-card' });
       const iconEl = c.createDiv({ cls: 'mdb-dash-card-icon' });
       setIcon(iconEl, icon);
@@ -3336,6 +3763,7 @@ class MotionDatabaseView extends ItemView {
       const tbody = tbl.createEl('tbody');
       tables.forEach(t => {
         const td = d.tableData(t);
+        if (!td) return;
         const tr = tbody.createEl('tr');
         const nameTd = tr.createEl('td');
         const link = nameTd.createEl('a', { text: t, cls: 'mdb-dash-link' });
@@ -3358,7 +3786,8 @@ class MotionDatabaseView extends ItemView {
       ['View', 'Definition'].forEach(h => vth.createEl('th', { text: h }));
       const vtbody = vtbl.createEl('tbody');
       views.forEach(v => {
-        const vdef = d.engine.schema.__views__[v];
+        const vdef = d.engine.schema.__views__?.[v];
+        if (!vdef) return;
         const tr = vtbody.createEl('tr');
         tr.createEl('td', { text: v });
         const defCell = tr.createEl('td');
@@ -3389,11 +3818,13 @@ class MotionDatabaseView extends ItemView {
 
   // ── ERD ────────────────────────────────────────────────────────────────────
 
-  renderERD(el) {
+  renderERD(el: HTMLElement): void {
     const hdr = el.createDiv({ cls: 'mdb-content-hdr' });
     hdr.createEl('h2', { cls: 'mdb-content-title', text: 'Relationships' });
 
-    const tables = this.db.tables();
+    const db = this.db;
+    if (!db) return;
+    const tables = db.tables();
     if (!tables.length) {
       el.createDiv({ cls: 'mdb-empty', text: 'No tables to diagram.' });
       return;
@@ -3407,17 +3838,21 @@ class MotionDatabaseView extends ItemView {
     wrap.appendChild(svg);
 
     const ns = 'http://www.w3.org/2000/svg';
-    const mk = (tag, attrs = {}) => {
-      const el = activeDocument.createElementNS(ns, tag);
-      Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
-      return el;
+    const mk = <K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number> = {}): SVGElementTagNameMap[K] => {
+      const element = document.createElementNS(ns, tag) as SVGElementTagNameMap[K];
+      Object.entries(attrs).forEach(([key, value]) => element.setAttribute(key, String(value)));
+      return element;
     };
 
     // ── Layout ──
     const {
       positions, totalW, totalH,
       CARD_W, CARD_H_BASE, ROW_H, GAP_X,
-    } = computeERDLayout(tables, table => this.db.tableData(table));
+    } = computeERDLayout(tables, table => {
+      const definition = db.tableData(table);
+      if (!definition) throw new Error(`Table '${table}' is missing from the database schema.`);
+      return definition;
+    });
     svg.setAttribute('width', String(totalW));
     svg.setAttribute('height', String(totalH));
 
@@ -3445,14 +3880,14 @@ class MotionDatabaseView extends ItemView {
     };
 
     // ── Mouse drag (pan) ──
-    wrap.onmousedown = (e) => {
-      if (e.target.closest('g[data-table]')) return;
+    wrap.onmousedown = (e: MouseEvent) => {
+      if (e.target instanceof Element && e.target.closest('g[data-table]')) return;
       dragging = true; lastX = e.clientX; lastY = e.clientY;
       wrap.classList.add('is-panning');
     };
 
     // Use named handlers so we can remove them when this ERD instance is torn down
-    const onMouseMove = (e) => {
+    const onMouseMove = (e: MouseEvent) => {
       if (!dragging) return;
       panX += e.clientX - lastX;
       panY += e.clientY - lastY;
@@ -3522,7 +3957,8 @@ class MotionDatabaseView extends ItemView {
 
     // ── Draw FK arrows first (behind tables) ──
     tables.forEach(t => {
-      const tbl = this.db.tableData(t);
+      const tbl = db.tableData(t);
+      if (!tbl) return;
       tbl.columns.filter(c => c.fk).forEach((c, columnIndex) => {
         const src = positions[t];
         const dst = positions[c.fk.table];
@@ -3530,8 +3966,12 @@ class MotionDatabaseView extends ItemView {
 
         // Anchor at the foreign-key row so multiple relationships remain
         // visually distinct instead of piling onto the table header.
-        let x1, y1, x2, y2, cx1, cx2;
-        y1 = src.y + CARD_H_BASE + columnIndex * ROW_H + ROW_H / 2;
+        let x1: number;
+        let y1 = src.y + CARD_H_BASE + columnIndex * ROW_H + ROW_H / 2;
+        let x2: number;
+        let y2: number;
+        let cx1: number;
+        let cx2: number;
         if (src === dst) {
           x1 = src.x + CARD_W;
           x2 = src.x + CARD_W;
@@ -3566,8 +4006,9 @@ class MotionDatabaseView extends ItemView {
 
     // ── Draw table cards ──
     tables.forEach(t => {
-      const tbl = this.db.tableData(t);
+      const tbl = db.tableData(t);
       const p = positions[t];
+      if (!tbl || !p) return;
       const g = mk('g', { transform: `translate(${p.x},${p.y})`, cursor: 'pointer' });
       g.setAttribute('data-table', t);
 
@@ -3627,7 +4068,7 @@ class MotionDatabaseView extends ItemView {
         g.appendChild(nameText);
 
         // Badges (PK / FK / AI / NN)
-        const badges = [];
+        const badges: Array<[string, string]> = [];
         if (c.pk) badges.push(['PK', 'var(--background-modifier-border)']);
         if (c.fk) badges.push(['FK', 'var(--background-modifier-border)']);
         if (c.ai) badges.push(['AI', 'var(--background-modifier-border)']);
@@ -3681,12 +4122,12 @@ class MotionDatabaseView extends ItemView {
 
   // ── Cheatsheet ──────────────────────────────────────────────────────────────
 
-  renderCheatsheet(el) {
+  renderCheatsheet(el: HTMLElement): void {
     el.createEl('h2', { cls: 'mdb-content-title', text: 'SQL reference' });
 
-    const S = (sql, desc) => [sql, desc];
+    const S = (sql: string, desc: string): [string, string] => [sql, desc];
 
-    const sections = [
+    const sections: Array<{ title: string; color: string; rows: Array<[string, string]> }> = [
       {
         title: 'Meta Commands (Terminal)', color: 'var(--color-blue)',
         rows: [
@@ -3880,7 +4321,7 @@ class MotionDatabaseView extends ItemView {
 
   // ── Tables overview ────────────────────────────────────────────────────────
 
-  renderTablesOverview(el) {
+  renderTablesOverview(el: HTMLElement): void {
     const hdr = el.createDiv({ cls: 'mdb-content-hdr' });
     hdr.createEl('h2', { cls: 'mdb-content-title', text: 'Tables' });
     const newBtn = hdr.createEl('button', { cls: 'mdb-btn mdb-btn-primary' });
@@ -3890,7 +4331,9 @@ class MotionDatabaseView extends ItemView {
     setButtonContent(importBtn, 'upload', 'Import CSV');
     importBtn.onclick = () => this.importCSV();
 
-    const tables = this.db.tables();
+    const db = this.db;
+    if (!db) return;
+    const tables = db.tables();
     if (!tables.length) {
       const empty = el.createDiv({ cls: 'mdb-empty' });
       const emptyIcon = empty.createDiv({ cls: 'mdb-empty-icon' });
@@ -3909,7 +4352,8 @@ class MotionDatabaseView extends ItemView {
 
     const grid = el.createDiv({ cls: 'mdb-tables-grid' });
     tables.forEach(t => {
-      const tbl = this.db.tableData(t);
+      const tbl = db.tableData(t);
+      if (!tbl) return;
       const card = grid.createDiv({ cls: 'mdb-table-card' });
       const ch = card.createDiv({ cls: 'mdb-table-card-hdr' });
       const cardIcon = ch.createSpan({ cls: 'mdb-table-card-icon' });
@@ -3943,11 +4387,13 @@ class MotionDatabaseView extends ItemView {
 
   // ── SQL Terminal ───────────────────────────────────────────────────────────
 
-  renderSQLTerminal(el) {
+  renderSQLTerminal(el: HTMLElement): void {
+    const db = this.db;
+    if (!db) return;
     const hdr = el.createDiv({ cls: 'mdb-content-hdr' });
     const titleWrap = hdr.createDiv({ cls: 'mdb-sql-title-wrap' });
     titleWrap.createEl('h2', { cls: 'mdb-content-title', text: 'SQL' });
-    titleWrap.createSpan({ cls: 'mdb-sql-prompt-db', text: this.db.name });
+    titleWrap.createSpan({ cls: 'mdb-sql-prompt-db', text: db.name });
 
     // Editor
     const textarea = el.createEl('textarea', { cls: 'mdb-sql-editor' });
@@ -3962,15 +4408,16 @@ class MotionDatabaseView extends ItemView {
     const clearBtn = controls.createEl('button', { cls: 'mdb-btn' });
     setButtonContent(clearBtn, 'eraser', 'Clear');
 
-    const snippets = controls.createDiv({ cls: 'mdb-sql-snippets' });
-    [
+    const snippetsEl = controls.createDiv({ cls: 'mdb-sql-snippets' });
+    const snippets: Array<[string, string]> = [
       ['\\dt', '\\dt'],
       ['SELECT *', 'SELECT * FROM '],
       ['CREATE TABLE', 'CREATE TABLE my_table (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  name TEXT NOT NULL\n);'],
       ['INSERT', "INSERT INTO  (col1, col2)\nVALUES ('val1', 'val2');"],
       ['DESCRIBE', 'DESCRIBE '],
-    ].forEach(([label, sql]) => {
-      const btn = snippets.createEl('button', { cls: 'mdb-snippet-btn', text: label });
+    ];
+    snippets.forEach(([label, sql]) => {
+      const btn = snippetsEl.createEl('button', { cls: 'mdb-snippet-btn', text: label });
       btn.onclick = () => { textarea.value = sql; textarea.focus(); };
     });
 
@@ -4006,17 +4453,18 @@ class MotionDatabaseView extends ItemView {
         }
         if (metaResult === '__HISTORY__') {
           this._storeAndPrependBlock(outputEl, {
+            type: 'result',
             sql: '\\s', timestamp, elapsed: 0,
             result: { type: 'rows', columns: ['#', 'Query'], rows: this.sqlHistory.map((q, i) => [i + 1, q]) }
           });
           return;
         }
-        if (metaResult.__switch__) {
+        if ('__switch__' in metaResult) {
           const target = metaResult.__switch__.toLowerCase();
           const files = await this.getDBFiles();
-          let fp = null;
+          let fp: string | null = null;
           for (const f of files) {
-            const stem = f.split('/').pop().replace('.motiondb.json', '');
+            const stem = f.split('/').pop()?.replace('.motiondb.json', '') || '';
             if (stem.toLowerCase() === target) { fp = f; break; }
           }
           if (!fp) {
@@ -4035,17 +4483,17 @@ class MotionDatabaseView extends ItemView {
           await this.loadDB(fp);
           return;
         }
-        this._storeAndPrependBlock(outputEl, { sql: raw, timestamp, elapsed: Date.now() - start, result: metaResult });
+        this._storeAndPrependBlock(outputEl, { type: 'result', sql: raw, timestamp, elapsed: Date.now() - start, result: metaResult });
         return;
       }
 
       try {
-        const results = this.db.exec(raw);
+        const results = db.exec(raw);
         const elapsed = Date.now() - start;
         // If the batch included a COMMIT, write to disk immediately (bypass debounce).
         // If it included a ROLLBACK, don't write — the data was intentionally discarded.
-        const hasCommit = results.some(r => r._committed);
-        const hasRollback = results.some(r => r._rolledBack);
+        const hasCommit = results.some(result => result.type === 'ok' && result._committed);
+        const hasRollback = results.some(result => result.type === 'ok' && result._rolledBack);
         if (hasCommit) {
           await this.db.save();
           if (this.db.engine) this.db.engine._dirty = false;
@@ -4054,13 +4502,14 @@ class MotionDatabaseView extends ItemView {
         }
         results.forEach((result, i) => {
           this._storeAndPrependBlock(outputEl, {
+            type: 'result',
             sql: i === 0 ? raw : null,
             timestamp: i === 0 ? timestamp : null,
             elapsed, result
           });
         });
       } catch (err) {
-        this._storeAndPrependBlock(outputEl, { type: 'error', sql: raw, timestamp, elapsed: Date.now() - start, message: err.message });
+        this._storeAndPrependBlock(outputEl, { type: 'error', sql: raw, timestamp, elapsed: Date.now() - start, message: errorMessage(err) });
       }
     };
 
@@ -4084,29 +4533,29 @@ class MotionDatabaseView extends ItemView {
     textarea.focus();
   }
 
-  _storeAndPrependBlock(outputEl, block) {
+  _storeAndPrependBlock(outputEl: HTMLElement, block: SqlOutputBlock): void {
     if (!this.sqlOutputBlocks) this.sqlOutputBlocks = [];
     this.sqlOutputBlocks.push(block);
     if (this.sqlOutputBlocks.length > 50) this.sqlOutputBlocks.shift();
     this._renderOutputBlock(outputEl, block, false);
   }
 
-  _renderOutputBlock(container, block, append = false) {
-    const wrap = createDiv();
+  _renderOutputBlock(container: HTMLElement, block: SqlOutputBlock, append = false): void {
+    const wrap = document.createDiv();
     wrap.className = 'mdb-sql-result';
 
-    const result = block.result || block;
-    const isError = block.type === 'error' || result.type === 'error';
+    const result = block.type === 'result' ? block.result : null;
+    const isError = block.type === 'error' || result?.type === 'error';
 
     // SQL echo header
     if (block.sql) {
-      const echo = createDiv();
+      const echo = document.createDiv();
       echo.className = 'mdb-sql-echo';
-      const sqlSpan = createEl('code');
+      const sqlSpan = document.createEl('code');
       sqlSpan.className = 'mdb-sql-echo-text';
       sqlSpan.textContent = block.sql.length > 140 ? block.sql.slice(0, 140) + '…' : block.sql;
       echo.appendChild(sqlSpan);
-      const meta = createSpan();
+      const meta = document.createSpan();
       meta.className = 'mdb-sql-echo-meta';
       meta.textContent = [block.timestamp, block.elapsed != null ? `${block.elapsed}ms` : null].filter(Boolean).join(' · ');
       echo.appendChild(meta);
@@ -4115,40 +4564,43 @@ class MotionDatabaseView extends ItemView {
 
     // Result body
     if (isError) {
-      const errEl = createDiv();
+      const errEl = document.createDiv();
       errEl.className = 'mdb-sql-error';
       errEl.setAttribute('role', 'alert');
-      const icon = createSpan(); icon.className = 'mdb-error-icon'; setIcon(icon, 'alert-circle');
-      const errorCopy = createDiv(); errorCopy.className = 'mdb-feedback-copy';
-      const errorTitle = createEl('strong'); errorTitle.className = 'mdb-feedback-title'; errorTitle.textContent = 'Query failed';
-      const msg = createDiv(); msg.className = 'mdb-error-msg'; msg.textContent = block.message || result.message || 'The query could not be completed.';
+      const icon = document.createSpan(); icon.className = 'mdb-error-icon'; setIcon(icon, 'alert-circle');
+      const errorCopy = document.createDiv(); errorCopy.className = 'mdb-feedback-copy';
+      const errorTitle = document.createEl('strong'); errorTitle.className = 'mdb-feedback-title'; errorTitle.textContent = 'Query failed';
+      const errorMessage = block.type === 'error'
+        ? block.message
+        : result?.type === 'error' ? result.message : 'The query could not be completed.';
+      const msg = document.createDiv(); msg.className = 'mdb-error-msg'; msg.textContent = errorMessage;
       errorCopy.appendChild(errorTitle); errorCopy.appendChild(msg);
       errEl.appendChild(icon); errEl.appendChild(errorCopy);
       wrap.appendChild(errEl);
 
-    } else if (result.type === 'ok') {
-      const okEl = createDiv();
+    } else if (result?.type === 'ok') {
+      const okEl = document.createDiv();
       okEl.className = 'mdb-sql-ok';
       okEl.setAttribute('role', 'status');
-      const icon = createSpan(); icon.className = 'mdb-ok-icon'; setIcon(icon, 'check');
-      const successCopy = createDiv(); successCopy.className = 'mdb-feedback-copy';
-      const successTitle = createEl('strong'); successTitle.className = 'mdb-feedback-title'; successTitle.textContent = 'Query complete';
-      const msgEl = createDiv(); msgEl.className = 'mdb-ok-msg'; msgEl.textContent = result.message || 'The query completed successfully.';
-      const elapsed = createSpan(); elapsed.className = 'mdb-sql-elapsed'; elapsed.textContent = block.elapsed != null ? `${block.elapsed}ms` : '';
+      const icon = document.createSpan(); icon.className = 'mdb-ok-icon'; setIcon(icon, 'check');
+      const successCopy = document.createDiv(); successCopy.className = 'mdb-feedback-copy';
+      const successTitle = document.createEl('strong'); successTitle.className = 'mdb-feedback-title'; successTitle.textContent = 'Query complete';
+      const msgEl = document.createDiv(); msgEl.className = 'mdb-ok-msg'; msgEl.textContent = result.message || 'The query completed successfully.';
+      const elapsed = document.createSpan(); elapsed.className = 'mdb-sql-elapsed'; elapsed.textContent = block.elapsed != null ? `${block.elapsed}ms` : '';
       successCopy.appendChild(successTitle); successCopy.appendChild(msgEl);
       okEl.appendChild(icon); okEl.appendChild(successCopy); okEl.appendChild(elapsed);
       wrap.appendChild(okEl);
 
-    } else if (result.type === 'rows') {
+    } else if (result?.type === 'rows') {
       const rowCount = result.rows.length;
-      const meta = createDiv();
+      const meta = document.createDiv();
       meta.className = 'mdb-result-meta';
-      const countEl = createSpan();
+      const countEl = document.createSpan();
       countEl.className = 'mdb-result-count';
       countEl.textContent = rowCount === 0 ? 'Empty set (0 rows)' : `${rowCount} row${rowCount !== 1 ? 's' : ''}`;
       meta.appendChild(countEl);
       if (block.elapsed != null && block.sql) {
-        const elapsedEl = createSpan();
+        const elapsedEl = document.createSpan();
         elapsedEl.className = 'mdb-sql-elapsed';
         elapsedEl.textContent = `${block.elapsed}ms`;
         meta.appendChild(elapsedEl);
@@ -4156,21 +4608,21 @@ class MotionDatabaseView extends ItemView {
       wrap.appendChild(meta);
 
       if (rowCount > 0) {
-        const tableWrap = createDiv();
+        const tableWrap = document.createDiv();
         tableWrap.className = 'mdb-result-table-wrap';
-        const table = createEl('table');
+        const table = document.createEl('table');
         table.className = 'mdb-result-table';
         const thead = table.createTHead().insertRow();
-        result.columns.forEach(c => { const th = createEl('th'); th.textContent = String(c); thead.appendChild(th); });
+        result.columns.forEach(c => { const th = document.createEl('th'); th.textContent = String(c); thead.appendChild(th); });
         const tbody = table.createTBody();
         result.rows.forEach(row => {
           const tr = tbody.insertRow();
           row.forEach(val => {
             const td = tr.insertCell();
             if (val === null || val === undefined) {
-              const span = createSpan(); span.className = 'mdb-null'; span.textContent = 'NULL'; td.appendChild(span);
+              const span = document.createSpan(); span.className = 'mdb-null'; span.textContent = 'NULL'; td.appendChild(span);
             } else if (typeof val === 'boolean') {
-              const span = createSpan(); span.className = val ? 'mdb-bool-true' : 'mdb-bool-false'; span.textContent = val ? 'TRUE' : 'FALSE'; td.appendChild(span);
+              const span = document.createSpan(); span.className = val ? 'mdb-bool-true' : 'mdb-bool-false'; span.textContent = val ? 'TRUE' : 'FALSE'; td.appendChild(span);
             } else { td.textContent = String(val); }
           });
         });
@@ -4183,15 +4635,15 @@ class MotionDatabaseView extends ItemView {
     else container.insertBefore(wrap, container.firstChild);
   }
 
-  appendOutput(container, result, elapsed) {
-    this._renderOutputBlock(container, { result, elapsed }, false);
+  appendOutput(container: HTMLElement, result: SqlRenderResult, elapsed: number): void {
+    this._renderOutputBlock(container, { type: 'result', result, elapsed }, false);
   }
 
-  appendError(container, message) {
+  appendError(container: HTMLElement, message: string): void {
     this._renderOutputBlock(container, { type: 'error', message }, false);
   }
 
-  handleMetaCommand(raw) {
+  handleMetaCommand(raw: string): SqlRenderResult | { __switch__: string } | '__CLEAR__' | '__HISTORY__' | null {
     const s = raw.trim().replace(/;$/, '').trim();
     const lower = s.toLowerCase();
     if (lower === '\\q' || lower === 'clear') return '__CLEAR__';
@@ -4199,7 +4651,7 @@ class MotionDatabaseView extends ItemView {
     if (lower === '\\dt' || lower === 'show tables') return this.db.exec('SHOW TABLES')[0];
     if (lower.startsWith('\\d ')) {
       const tname = s.slice(3).trim();
-      try { return this.db.exec(`DESCRIBE ${tname}`)[0]; } catch (e) { return { type: 'error', message: e.message }; }
+      try { return this.db.exec(`DESCRIBE ${tname}`)[0]; } catch (e) { return { type: 'error', message: errorMessage(e) }; }
     }
     if (lower.startsWith('\\c ') || lower.startsWith('use ')) {
       const dbName = s.replace(/^(\\c|use)\s+/i, '').trim();
@@ -4208,8 +4660,8 @@ class MotionDatabaseView extends ItemView {
     return null;
   }
 
-  async getDBFiles() {
-    let files = [];
+  async getDBFiles(): Promise<string[]> {
+    let files: string[] = [];
     try {
       const d = await this.plugin.app.vault.adapter.list(DB_DIR);
       files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
@@ -4221,8 +4673,10 @@ class MotionDatabaseView extends ItemView {
 
   // ── Table browse view ─────────────────────────────────────────────────────
 
-  renderTableView(el, tableName) {
-    const tbl = this.db.tableData(tableName);
+  renderTableView(el: HTMLElement, tableName: string): void {
+    const db = this.db;
+    if (!db) return;
+    const tbl = db.tableData(tableName);
     if (!tbl) { el.createDiv({ cls: 'mdb-empty', text: `Table "${tableName}" not found.` }); return; }
 
     // Header
@@ -4280,28 +4734,28 @@ class MotionDatabaseView extends ItemView {
     const tbody = table.createEl('tbody');
 
     // ── Helper: build a cell input for a given column ──
-    const buildInput = (c, value, inputMap) => {
+    const buildInput = (c: DbColumn, value: unknown, inputMap: Record<string, HTMLInputElement>): HTMLInputElement => {
       // FK column — show a datalist for autocomplete
       if (c.fk) {
-        const refTbl = this.db.tableData(c.fk.table);
-        const inp = createEl('input');
+        const refTbl = db.tableData(c.fk.table);
+        const inp = document.createEl('input');
         inp.className = 'mdb-cell-input';
         inp.value = value !== null && value !== undefined ? String(value) : '';
         inp.placeholder = 'NULL';
         if (refTbl) {
           const dlId = `mdb-dl-${tableName}-${c.name}`;
-          let dl = activeDocument.getElementById(dlId);
+          let dl = document.getElementById(dlId);
           if (!dl) {
-            dl = createEl('datalist');
+            dl = document.createEl('datalist');
             dl.id = dlId;
             refTbl.rows.forEach(r => {
-              const opt = createEl('option');
+              const opt = document.createEl('option');
               opt.value = String(r[c.fk.col] ?? '');
               const label = Object.values(r).slice(0, 3).map(value => toDisplayString(value, true)).join(' · ');
               opt.label = label;
               dl.appendChild(opt);
             });
-            activeDocument.body.appendChild(dl);
+            document.body.appendChild(dl);
           }
           inp.setAttribute('list', dlId);
         }
@@ -4311,7 +4765,7 @@ class MotionDatabaseView extends ItemView {
       // Boolean / INTEGER 0-1 — checkbox
       const presentation = storedColumnPropertyFormat(c);
       if (presentation?.type === 'checkbox' || (!c.presentation && c.type === 'INTEGER' && (c.name.startsWith('is_') || c.name.startsWith('has_')))) {
-        const inp = createEl('input');
+        const inp = document.createEl('input');
         inp.type = 'checkbox';
         inp.className = 'mdb-cell-check';
         inp.checked = !!value;
@@ -4319,7 +4773,7 @@ class MotionDatabaseView extends ItemView {
         return inp;
       }
       // Default — text input
-      const inp = createEl('input');
+      const inp = document.createEl('input');
       inp.className = 'mdb-cell-input';
       inp.value = value !== null && value !== undefined ? String(value) : '';
       inp.placeholder = c.notNull ? (c.default !== undefined ? String(c.default) : '') : 'NULL';
@@ -4335,7 +4789,7 @@ class MotionDatabaseView extends ItemView {
       return inp;
     };
 
-    const renderStoredCell = (td, column, value) => {
+    const renderStoredCell = (td: HTMLTableCellElement, column: DbColumn, value: unknown): void => {
       td.empty();
       if (value === null || value === undefined) {
         td.createSpan({ cls: 'mdb-null', text: 'NULL' });
@@ -4347,7 +4801,7 @@ class MotionDatabaseView extends ItemView {
     };
 
     // ── Helper: read input value → SQL literal ──
-    const readVal = (c, inputMap) => {
+    const readVal = (c: DbColumn, inputMap: Record<string, HTMLInputElement>): string => {
       const inp = inputMap[c.name];
       if (!inp) return 'NULL';
       if (inp.type === 'checkbox') return inp.checked ? '1' : '0';
@@ -4358,11 +4812,11 @@ class MotionDatabaseView extends ItemView {
     };
 
     // ── Existing rows ──
-    const renderDataRow = (row, i, before = null) => {
+    const renderDataRow = (row: DbRow, i: number, before: HTMLTableRowElement | null = null): HTMLTableRowElement => {
       const tr = tbody.createEl('tr', { cls: 'mdb-tr' });
       if (before) tbody.insertBefore(tr, before);
       let editMode = false;
-      const inputMap = {};
+      const inputMap: Record<string, HTMLInputElement> = {};
 
       const numTd = tr.createEl('td', { cls: 'mdb-td mdb-td-num' });
       numTd.createSpan({ cls: 'mdb-row-num', text: String(i + 1) });
@@ -4425,12 +4879,12 @@ class MotionDatabaseView extends ItemView {
           inp.onkeydown = e => {
             if (e.key === 'Enter') {
               e.preventDefault();
-              void saveEdit().catch(error => new Notice(`Could not save row: ${error.message}`));
+              void saveEdit().catch(error => new Notice(`Could not save row: ${errorMessage(error)}`));
             }
             if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
             if (e.key === 'Tab' && !e.shiftKey && idx === inputs.length - 1) {
               e.preventDefault();
-              void saveEdit().catch(error => new Notice(`Could not save row: ${error.message}`));
+              void saveEdit().catch(error => new Notice(`Could not save row: ${errorMessage(error)}`));
             }
           };
         });
@@ -4457,7 +4911,7 @@ class MotionDatabaseView extends ItemView {
           });
           exitEditDisplay();
           this._scheduleSave();
-        } catch (e) { new Notice('Error: ' + e.message); }
+        } catch (e) { new Notice(`Error: ${errorMessage(e)}`); }
       };
 
       const cancelEdit = () => { exitEditDisplay(); };
@@ -4477,7 +4931,7 @@ class MotionDatabaseView extends ItemView {
         del.onclick = doDelete;
       };
 
-      const doDelete = async e => {
+      const doDelete = async (e?: MouseEvent): Promise<void> => {
         if (e) e.stopPropagation();
         const pkCol = tbl.columns.find(c => c.pk);
         if (pkCol) {
@@ -4485,7 +4939,7 @@ class MotionDatabaseView extends ItemView {
             const pkVal = row[pkCol.name];
             const pkLit = typeof pkVal === 'number' ? String(pkVal) : `'${String(pkVal).replace(/'/g, "''")}'`;
             this.db.exec(`DELETE FROM ${tableName} WHERE ${pkCol.name} = ${pkLit}`);
-          } catch (e) { new Notice('Error: ' + e.message); return; }
+          } catch (e) { new Notice(`Error: ${errorMessage(e)}`); return; }
         } else {
           const idx = tbl.rows.indexOf(row);
           if (idx !== -1) {
@@ -4494,7 +4948,7 @@ class MotionDatabaseView extends ItemView {
           }
         }
         tr.remove();
-        [...tbody.querySelectorAll('.mdb-row-num')].forEach((number, index) => number.setText(String(index + 1)));
+        Array.from(tbody.querySelectorAll('.mdb-row-num')).forEach((number, index) => number.setText(String(index + 1)));
         metaEl.textContent = `${tbl.columns.length} columns · ${tbl.rows.length} rows`;
         this._scheduleSave();
       };
@@ -4510,7 +4964,7 @@ class MotionDatabaseView extends ItemView {
 
     // ── Inline insert row ──
     const insertRow = tbody.createEl('tr', { cls: 'mdb-tr mdb-tr-insert' });
-    const insertInputMap = {};
+    const insertInputMap: Record<string, HTMLInputElement> = {};
 
     insertRow.createEl('td', { cls: 'mdb-td mdb-td-num' }).createSpan({ cls: 'mdb-insert-icon', text: '+' });
 
@@ -4533,7 +4987,7 @@ class MotionDatabaseView extends ItemView {
       try {
         const cols = tbl.columns.filter(c => !c.ai).map(c => c.name);
         const values = tbl.columns.filter(c => !c.ai).map(c => readVal(c, insertInputMap));
-        this.db.exec(`INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${values.join(', ')})`);
+        db.exec(`INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${values.join(', ')})`);
         metaEl.textContent = `${tbl.columns.length} columns · ${tbl.rows.length} rows`;
         this._scheduleSave();
         // Use the same controls/edit handlers as existing rows, without
@@ -4553,18 +5007,18 @@ class MotionDatabaseView extends ItemView {
           const first = tbl.columns.find(c => !c.ai);
           if (first && insertInputMap[first.name]) insertInputMap[first.name].focus();
         }
-      } catch (e) { new Notice('Error: ' + e.message); }
+      } catch (e) { new Notice(`Error: ${errorMessage(e)}`); }
     };
 
     doInsertBtn.onclick = () => doInsert(true);
 
     // Tab from last editable insert input → triggers insert and loops back
-    const insertInputs = tbl.columns.filter(c => !c.ai).map(c => insertInputMap[c.name]).filter(Boolean);
+    const insertInputs = tbl.columns.filter(c => !c.ai).map(c => insertInputMap[c.name]).filter((input): input is HTMLInputElement => input instanceof HTMLInputElement);
     insertInputs.forEach((inp, idx) => {
       inp.onkeydown = e => {
         if (e.key === 'Enter') {
           e.preventDefault();
-          void doInsert(true).catch(error => new Notice(`Could not insert row: ${error.message}`));
+          void doInsert(true).catch(error => new Notice(`Could not insert row: ${errorMessage(error)}`));
         }
         if (e.key === 'Escape') {
           e.preventDefault();
@@ -4572,7 +5026,7 @@ class MotionDatabaseView extends ItemView {
         }
         if (e.key === 'Tab' && !e.shiftKey && idx === insertInputs.length - 1) {
           e.preventDefault();
-          void doInsert(true).catch(error => new Notice(`Could not insert row: ${error.message}`));
+          void doInsert(true).catch(error => new Notice(`Could not insert row: ${errorMessage(error)}`));
         }
       };
     });
@@ -4596,7 +5050,7 @@ class MotionDatabaseView extends ItemView {
 
 // ── New Table Modal ────────────────────────────────────────────────────────────
 
-function installModalFooter(contentEl, setting) {
+function installModalFooter(contentEl: HTMLElement, setting: Setting): void {
   const footer = setting.settingEl;
   footer.addClass('mdb-modal-actions');
   const body = contentEl.createDiv({ cls: 'mdb-modal-body' });
@@ -4605,14 +5059,17 @@ function installModalFooter(contentEl, setting) {
 }
 
 class NewTableModal extends Modal {
-  constructor(app, db, onSave) { super(app); this.db = db; this.onSave = onSave; }
+  db: MotionDB;
+  onSave: () => Promise<void>;
+
+  constructor(app: App, db: MotionDB, onSave: () => Promise<void>) { super(app); this.db = db; this.onSave = onSave; }
 
   onOpen() {
     this.modalEl.addClass('mdb-modal', 'mdb-new-table-modal');
     this.setTitle('New Table');
     const { contentEl } = this;
 
-    let updatePreview = () => { };
+    let updatePreview: () => void = () => { };
     let tableName = '';
     new Setting(contentEl).setName('Table name').addText(t => {
       t.setPlaceholder('users');
@@ -4625,7 +5082,19 @@ class NewTableModal extends Modal {
 
     contentEl.createEl('h3', { cls: 'mdb-modal-section', text: 'Columns' });
 
-    const cols = [{ name: 'id', type: 'INTEGER', pk: true, ai: true, notNull: true, unique: false, defaultVal: '', presentation: 'default', ratingMax: 5 }];
+    type ColumnFlag = 'pk' | 'ai' | 'notNull' | 'unique';
+    interface ColumnDraft {
+      name: string;
+      type: string;
+      pk: boolean;
+      ai: boolean;
+      notNull: boolean;
+      unique: boolean;
+      defaultVal: string;
+      presentation: string;
+      ratingMax: number;
+    }
+    const cols: ColumnDraft[] = [{ name: 'id', type: 'INTEGER', pk: true, ai: true, notNull: true, unique: false, defaultVal: '', presentation: 'default', ratingMax: 5 }];
     const colsEl = contentEl.createDiv({ cls: 'mdb-col-editor' });
 
     const renderCols = () => {
@@ -4665,9 +5134,9 @@ class NewTableModal extends Modal {
           max.oninput = () => { cols[i].ratingMax = Math.max(1, Math.min(100, Math.round(Number(max.value) || 5))); };
         } else row.createSpan({ cls: 'mdb-col-max-spacer' });
 
-        const checkboxLabels = { pk: 'Primary key', ai: 'Auto increment', notNull: 'Not null', unique: 'Unique' };
-        const mkCb = key => {
-          const checkbox = createEl('input');
+        const checkboxLabels: Record<ColumnFlag, string> = { pk: 'Primary key', ai: 'Auto increment', notNull: 'Not null', unique: 'Unique' };
+        const mkCb = (key: ColumnFlag): HTMLInputElement => {
+          const checkbox = row.createEl('input');
           checkbox.type = 'checkbox';
           checkbox.className = 'mdb-col-checkbox';
           checkbox.checked = Boolean(col[key]);
@@ -4740,7 +5209,7 @@ class NewTableModal extends Modal {
           if (created) this.db.engine._dirty = true;
           await this.onSave();
           this.close();
-        } catch (e) { new Notice('Error: ' + e.message); }
+        } catch (e) { new Notice(`Error: ${errorMessage(e)}`); }
       }))
       .addButton(b => b.setButtonText('Cancel').onClick(() => this.close()));
     installModalFooter(contentEl, actions);
@@ -4751,7 +5220,11 @@ class NewTableModal extends Modal {
 // ── Structure Modal ────────────────────────────────────────────────────────────
 
 class StructureModal extends Modal {
-  constructor(app, db, tableName, onSave) { super(app); this.db = db; this.tableName = tableName; this.onSave = onSave; }
+  db: MotionDB;
+  tableName: string;
+  onSave: () => Promise<void>;
+
+  constructor(app: App, db: MotionDB, tableName: string, onSave: () => Promise<void>) { super(app); this.db = db; this.tableName = tableName; this.onSave = onSave; }
 
   onOpen() {
     this.modalEl.addClass('mdb-modal');
@@ -4789,7 +5262,7 @@ class StructureModal extends Modal {
             .addOption('rating-number', 'Rating · number')
             .setValue(columnPresentationChoice(column))
             .onChange(async value => {
-              column.presentation = presentationFromChoice(value, current.max || 5);
+              column.presentation = presentationFromChoice(value, current.type === 'rating' ? current.max : 5);
               this.db.engine._dirty = true;
               await this.onSave();
               renderPresentations();
@@ -4849,7 +5322,7 @@ class StructureModal extends Modal {
           }
           await this.onSave();
           this.close();
-        } catch (e) { new Notice('Error: ' + e.message); }
+        } catch (e) { new Notice(`Error: ${errorMessage(e)}`); }
       }))
       .addButton(b => b.setButtonText('Close').onClick(() => this.close()));
     installModalFooter(contentEl, actions);
@@ -4860,7 +5333,11 @@ class StructureModal extends Modal {
 // ── Confirm Modal ──────────────────────────────────────────────────────────────
 
 class ConfirmModal extends Modal {
-  constructor(app, message, onConfirm, onCancel) { super(app); this.message = message; this.onConfirm = onConfirm; this.onCancel = onCancel || null; }
+  message: string;
+  onConfirm: () => void;
+  onCancel: (() => void) | null;
+
+  constructor(app: App, message: string, onConfirm: () => void, onCancel?: () => void) { super(app); this.message = message; this.onConfirm = onConfirm; this.onCancel = onCancel || null; }
   onOpen() {
     this.modalEl.addClass('mdb-modal', 'mdb-confirm-modal');
     this.setTitle('Confirm action');
@@ -4876,7 +5353,13 @@ class ConfirmModal extends Modal {
 // ── Home View ──────────────────────────────────────────────────────────────────
 
 class MotionDatabaseHomeView extends ItemView {
-  constructor(leaf, plugin) {
+  plugin: MotionDatabasePluginAPI;
+  creating: boolean;
+  newName: string;
+  renaming: string | null;
+  file: { name: string; path: string; extension: string };
+
+  constructor(leaf: WorkspaceLeaf, plugin: MotionDatabasePluginAPI) {
     super(leaf);
     this.plugin = plugin;
     this.creating = false;
@@ -4901,12 +5384,12 @@ class MotionDatabaseHomeView extends ItemView {
   getState() { return { view: 'home' }; }
   async setState() { /* nothing to restore — render() loads fresh data */ }
 
-  async render() {
+  async render(): Promise<void> {
     const root = this.containerEl;
     root.empty();
 
     // Load all database files
-    let files = [];
+    let files: string[] = [];
     try {
       const d = await this.plugin.app.vault.adapter.list(DB_DIR);
       files = (d.files || []).filter(f => f.endsWith('.motiondb.json'));
@@ -4917,19 +5400,25 @@ class MotionDatabaseHomeView extends ItemView {
     }
 
     // Load metadata for each db
-    const databases = [];
+    const databases: DatabaseSummary[] = [];
     for (const fp of files) {
       try {
         const raw = await this.plugin.app.vault.adapter.read(fp);
-        const data = JSON.parse(raw);
-        const schema = data.schema || {};
+        const data: unknown = JSON.parse(raw);
+        if (!isRecord(data)) throw new Error('Database metadata must be a JSON object.');
+        const schemaValue = data.schema ?? {};
+        if (!isDbSchema(schemaValue)) throw new Error('Database metadata contains an invalid schema.');
+        const schema = schemaValue;
         const tableNames = Object.keys(schema).filter(k => k !== '__views__');
-        const totalRows = tableNames.reduce((s, t) => s + (schema[t]?.rows?.length || 0), 0);
+        const totalRows = tableNames.reduce((sum, tableName) => {
+          const table = schema[tableName];
+          return sum + (isDbTable(table) ? table.rows.length : 0);
+        }, 0);
         const viewCount = Object.keys(schema.__views__ || {}).length;
         const stat = await this.plugin.app.vault.adapter.stat(fp);
         databases.push({
           filePath: fp,
-          name: data.name || fp.split('/').pop().replace('.motiondb.json', ''),
+          name: typeof data.name === 'string' && data.name ? data.name : fp.split('/').pop()?.replace('.motiondb.json', '') || 'Untitled',
           tables: tableNames.length,
           rows: totalRows,
           views: viewCount,
@@ -4970,7 +5459,7 @@ class MotionDatabaseHomeView extends ItemView {
     });
 
     const metrics = heroIntro.createDiv({ cls: 'mdb-home-metrics' });
-    const addMetric = (icon, value, label) => {
+    const addMetric = (icon: string, value: number, label: string) => {
       const metric = metrics.createDiv({ cls: 'mdb-home-metric' });
       const metricIcon = metric.createSpan({ cls: 'mdb-home-metric-icon' });
       setIcon(metricIcon, icon);
@@ -5036,7 +5525,7 @@ class MotionDatabaseHomeView extends ItemView {
                 window._motionDBRegistry[newName] = db;
               }
               new Notice(`Renamed to "${newName}"`);
-            } catch (e) { new Notice('Rename failed: ' + e.message); }
+            } catch (e) { new Notice(`Rename failed: ${errorMessage(e)}`); }
             this.renaming = null;
             await this.render();
           };
@@ -5056,7 +5545,7 @@ class MotionDatabaseHomeView extends ItemView {
         }
         // Stats
         const stats = top.createDiv({ cls: 'mdb-db-card-stats' });
-        const addStat = (val, lbl) => {
+        const addStat = (val: string | number, lbl: string): void => {
           const s = stats.createDiv({ cls: 'mdb-db-stat' });
           s.createDiv({ cls: 'mdb-db-stat-val', text: String(val) });
           s.createDiv({ cls: 'mdb-db-stat-lbl', text: lbl });
@@ -5096,11 +5585,11 @@ class MotionDatabaseHomeView extends ItemView {
               await this.plugin.deleteDatabase(dbInfo.filePath);
               // Close any open leaf for this db
               this.plugin.app.workspace.getLeavesOfType(VIEW_TYPE).forEach(leaf => {
-                if (leaf.view?.db?.filePath === dbInfo.filePath) leaf.detach();
+                if (isMotionDatabaseView(leaf.view) && leaf.view.db?.filePath === dbInfo.filePath) leaf.detach();
               });
               new Notice(`"${dbInfo.name}" deleted`);
               await this.render();
-            } catch (e) { new Notice('Delete failed: ' + e.message); }
+            } catch (e) { new Notice(`Delete failed: ${errorMessage(e)}`); }
           }).open();
         };
       });
@@ -5165,7 +5654,7 @@ class MotionDatabaseHomeView extends ItemView {
         setButtonContent(createBtn, 'plus', 'Create');
         await this.render();
       } catch (e) {
-        new Notice('Failed to create database: ' + e.message);
+        new Notice(`Failed to create database: ${errorMessage(e)}`);
         createBtn.disabled = false;
         createBtn.removeClass('is-loading');
         setButtonContent(createBtn, 'plus', 'Create');
@@ -5175,38 +5664,48 @@ class MotionDatabaseHomeView extends ItemView {
     createBtn.onclick = doCreate;
     nameInput.onkeydown = e => {
       if (e.key === 'Enter' && !createBtn.disabled) {
-        void doCreate().catch(error => new Notice(`Could not create database: ${error.message}`));
+        void doCreate().catch(error => new Notice(`Could not create database: ${errorMessage(error)}`));
       }
     };
   }
 
-  onClose() { this.containerEl.empty(); }
+  async onClose(): Promise<void> { this.containerEl.empty(); }
 }
 
-function getEmbedPropertyFormat(formats, column) {
+function isMotionDatabaseView(view: unknown): view is MotionDatabaseView {
+  return view instanceof MotionDatabaseView;
+}
+
+function isMotionDatabaseHomeView(view: unknown): view is MotionDatabaseHomeView {
+  return view instanceof MotionDatabaseHomeView;
+}
+
+function getEmbedPropertyFormat(formats: PropertyFormats | undefined, column: string): PropertyFormat {
   if (!formats) return { type: 'text' };
   if (formats[column]) return formats[column];
   const key = Object.keys(formats).find(name => name.toLowerCase() === String(column).toLowerCase());
   return key ? formats[key] : { type: 'text' };
 }
 
-function normalizeColumnPresentation(presentation) {
-  if (!presentation || presentation.type === 'default') return { type: 'default' };
+function normalizeColumnPresentation(presentation: unknown): ColumnPresentation {
+  if (!isRecord(presentation) || presentation.type === 'default') return { type: 'default' };
   if (presentation.type === 'checkbox') return { type: 'checkbox' };
   if (presentation.type === 'rating') {
-    const style = ['stars', 'hearts', 'number'].includes(presentation.style) ? presentation.style : 'stars';
+    const style = ['stars', 'hearts', 'number'].includes(String(presentation.style))
+      ? presentation.style as 'stars' | 'hearts' | 'number'
+      : 'stars';
     const max = Math.max(1, Math.min(100, Math.round(Number(presentation.max) || 5)));
     return { type: 'rating', style, max };
   }
   return { type: 'default' };
 }
 
-function columnPresentationChoice(column) {
+function columnPresentationChoice(column: Pick<DbColumn, 'presentation'>) {
   const presentation = normalizeColumnPresentation(column?.presentation);
   return presentation.type === 'rating' ? `rating-${presentation.style}` : presentation.type;
 }
 
-function presentationFromChoice(choice, max = 5) {
+function presentationFromChoice(choice: unknown, max = 5): ColumnPresentation {
   if (choice === 'checkbox') return { type: 'checkbox' };
   if (String(choice).startsWith('rating-')) {
     return normalizeColumnPresentation({ type: 'rating', style: String(choice).slice(7), max });
@@ -5214,12 +5713,12 @@ function presentationFromChoice(choice, max = 5) {
   return { type: 'default' };
 }
 
-function storedColumnPropertyFormat(column) {
+function storedColumnPropertyFormat(column: Pick<DbColumn, 'presentation'>): Exclude<ColumnPresentation, { type: 'default' }> | null {
   const presentation = normalizeColumnPresentation(column?.presentation);
   return presentation.type === 'default' ? null : presentation;
 }
 
-function tableEmbedPropertyFormats(table, configured = {}) {
+function tableEmbedPropertyFormats(table: DbTable, configured: PropertyFormats = {}): PropertyFormats {
   const formats = { ...configured };
   table.columns.forEach(column => {
     const alreadyConfigured = Object.keys(formats).some(name => name.toLowerCase() === String(column.name).toLowerCase());
@@ -5238,7 +5737,7 @@ function tableEmbedPropertyFormats(table, configured = {}) {
   return formats;
 }
 
-function embedPropertyIcon(format) {
+function embedPropertyIcon(format: PropertyFormat): string {
   if (format.type === 'image') return 'image';
   if (format.type === 'media') return 'paperclip';
   if (format.type === 'checkbox') return 'square-check';
@@ -5247,7 +5746,7 @@ function embedPropertyIcon(format) {
   return 'type';
 }
 
-function unwrapMediaValue(value) {
+function unwrapMediaValue(value: unknown): string {
   let raw = String(value ?? '').trim();
   const markdown = raw.match(/^!?\[[^\]]*\]\(([^)]+)\)$/);
   if (markdown) raw = markdown[1].trim();
@@ -5256,7 +5755,7 @@ function unwrapMediaValue(value) {
   return raw;
 }
 
-function resolveEmbedMedia(app, value, sourcePath = '') {
+function resolveEmbedMedia(app: App | undefined, value: unknown, sourcePath = ''): EmbedMediaResource {
   const raw = unwrapMediaValue(value);
   if (!raw) return { raw, src: '', extension: '' };
   const clean = raw.split('?')[0].split('#')[0];
@@ -5266,7 +5765,7 @@ function resolveEmbedMedia(app, value, sourcePath = '') {
   return { raw, src: file ? app.vault.getResourcePath(file) : raw, extension };
 }
 
-function renderEmbedPropertyValue(td, value, format, options = {}) {
+function renderEmbedPropertyValue(td: HTMLElement, value: unknown, format: PropertyFormat, options: EmbedPropertyRenderOptions = {}): void {
   td.empty();
   if (value === null || value === undefined || value === '') {
     td.createSpan({ cls: 'mdb-null', text: value === '' ? '' : 'Empty' });
@@ -5323,7 +5822,7 @@ function renderEmbedPropertyValue(td, value, format, options = {}) {
     if (format.type === 'image' || images.includes(media.extension)) {
       const image = td.createEl('img', { cls: 'mdb-property-image', attr: { src: media.src, alt: media.raw, loading: 'lazy' } });
       image.onerror = () => {
-        const missing = createSpan();
+        const missing = document.createSpan();
         missing.className = 'mdb-property-missing';
         missing.textContent = media.raw;
         image.replaceWith(missing);
@@ -5342,7 +5841,7 @@ function renderEmbedPropertyValue(td, value, format, options = {}) {
   td.setText(typeof value === 'object' ? JSON.stringify(value) : String(value));
 }
 
-function renderQueryResults(containerEl, results, options = {}) {
+function renderQueryResults(containerEl: HTMLElement, results: SqlResult[], options: QueryResultsOptions = {}): void {
   containerEl.empty();
   const result = [...results].reverse().find(item => item?.type === 'rows');
   if (!result) {
@@ -5410,7 +5909,7 @@ function renderQueryResults(containerEl, results, options = {}) {
                 if (td.isConnected) renderInteractiveProperty();
               } catch (error) {
                 if (td.isConnected) renderInteractiveProperty();
-                new Notice(error?.message || String(error));
+                new Notice(errorMessage(error));
               }
             },
           });
@@ -5447,7 +5946,7 @@ function renderQueryResults(containerEl, results, options = {}) {
               if (td.isConnected) renderValue(value);
             } catch (error) {
               if (td.isConnected) renderValue(value);
-              new Notice(error?.message || String(error));
+              new Notice(errorMessage(error));
             }
           };
           input.onkeydown = event => {
@@ -5486,7 +5985,7 @@ function renderQueryResults(containerEl, results, options = {}) {
               await options.onDelete(rowIndex);
             } catch (error) {
               if (deleteButton.isConnected) deleteButton.disabled = false;
-              new Notice(error?.message || String(error));
+              new Notice(errorMessage(error));
             }
           },
         ).open();
@@ -5496,7 +5995,7 @@ function renderQueryResults(containerEl, results, options = {}) {
 
   if (options.interactive && options.onAdd) {
     const draftRow = body.createEl('tr', { cls: 'mdb-query-add-row' });
-    const fields = [];
+    const fields: Array<{ columnIndex: number; input: HTMLInputElement; format: PropertyFormat }> = [];
     result.columns.forEach((column, columnIndex) => {
       const cell = draftRow.createEl('td');
       if (options.canAdd && !options.canAdd(columnIndex)) {
@@ -5527,13 +6026,13 @@ function renderQueryResults(containerEl, results, options = {}) {
         await options.onAdd(values);
       } catch (error) {
         save.disabled = false;
-        new Notice(error?.message || String(error));
+        new Notice(errorMessage(error));
       }
     };
   }
 }
 
-function renderDefaultQueryResults(containerEl, results) {
+function renderDefaultQueryResults(containerEl: HTMLElement, results: SqlResult[]): void {
   containerEl.empty();
   const result = [...results].reverse().find(item => item?.type === 'rows');
   if (!result) {
@@ -5558,7 +6057,13 @@ function renderDefaultQueryResults(containerEl, results) {
 }
 
 class MotionDatabaseEmbed extends MarkdownRenderChild {
-  constructor(containerEl, plugin, source, sourcePath = '') {
+  plugin: MotionDatabasePluginAPI;
+  source: string;
+  sourcePath: string;
+  renderVersion: number;
+  databaseName: string | null;
+
+  constructor(containerEl: HTMLElement, plugin: MotionDatabasePluginAPI, source: string, sourcePath = '') {
     super(containerEl);
     this.plugin = plugin;
     this.source = source;
@@ -5582,13 +6087,14 @@ class MotionDatabaseEmbed extends MarkdownRenderChild {
     try {
       const config = parseMotionDBEmbedSource(this.source);
       this.databaseName = config.database;
-      let results;
-      let label = null;
+      let results: SqlResult[];
+      let label: string | null = null;
 
       if (config.table) {
         const database = await window.motiondb.open(config.database);
-        const table = database.tableData(config.table);
-        if (!table) throw new Error(`Table “${config.table}” was not found in “${config.database}”.`);
+        const tableData: unknown = database.tableData(config.table);
+        if (!isDbTable(tableData)) throw new Error(`Table “${config.table}” was not found in “${config.database}”.`);
+        const table = tableData;
         const columns = table.columns.map(column => column.name);
         const sourceRows = config.limit === null ? table.rows : table.rows.slice(0, config.limit);
         results = [{
@@ -5599,34 +6105,34 @@ class MotionDatabaseEmbed extends MarkdownRenderChild {
         label = config.table;
         const primaryKey = table.columns.find(column => column.pk);
         const formats = tableEmbedPropertyFormats(table, config.properties);
-        const interactive = config.interactive && primaryKey ? {
+        const interactive: QueryResultsOptions | null = config.interactive && primaryKey ? {
           app: this.plugin.app,
-          canEdit: (_rowIndex, columnIndex) => {
+          canEdit: (_rowIndex: number, columnIndex: number) => {
             const column = table.columns[columnIndex];
             return !column.pk && !column.ai;
           },
-          onEdit: async (rowIndex, columnIndex, value) => {
+          onEdit: async (rowIndex: number, columnIndex: number, value: unknown) => {
             const row = sourceRows[rowIndex];
             const column = table.columns[columnIndex];
-            const quoteIdentifier = name => {
+            const quoteIdentifier = (name: string) => {
               if (String(name).includes('`')) throw new Error('Interactive embeds do not support backticks in names.');
               return `\`${name}\``;
             };
             const sql = `UPDATE ${quoteIdentifier(config.table)} SET ${quoteIdentifier(column.name)} = $1 WHERE ${quoteIdentifier(primaryKey.name)} = $2`;
             await database.query(sql, [value, row[primaryKey.name]]);
           },
-          onDelete: async rowIndex => {
+          onDelete: async (rowIndex: number) => {
             const row = sourceRows[rowIndex];
-            const quoteIdentifier = name => {
+            const quoteIdentifier = (name: string) => {
               if (String(name).includes('`')) throw new Error('Interactive embeds do not support backticks in names.');
               return `\`${name}\``;
             };
             const sql = `DELETE FROM ${quoteIdentifier(config.table)} WHERE ${quoteIdentifier(primaryKey.name)} = $1`;
             await database.query(sql, [row[primaryKey.name]]);
           },
-          canAdd: columnIndex => !table.columns[columnIndex].ai,
-          onAdd: async values => {
-            const quoteIdentifier = name => {
+          canAdd: (columnIndex: number) => !table.columns[columnIndex].ai,
+          onAdd: async (values: Array<{ columnIndex: number; value: unknown }>) => {
+            const quoteIdentifier = (name: string) => {
               if (String(name).includes('`')) throw new Error('Interactive embeds do not support backticks in names.');
               return `\`${name}\``;
             };
@@ -5679,28 +6185,31 @@ class MotionDatabaseEmbed extends MarkdownRenderChild {
     } catch (error) {
       if (version !== this.renderVersion) return;
       this.containerEl.empty();
-      this.containerEl.createDiv({ cls: 'mdb-query-error', text: error?.message || String(error) });
+      this.containerEl.createDiv({ cls: 'mdb-query-error', text: errorMessage(error) });
     }
   }
 }
 
-function registerBasesIntegration(plugin) {
+function registerBasesIntegration(plugin: MotionDatabasePluginAPI): boolean {
   if (!BasesView || typeof plugin.registerBasesView !== 'function') return false;
 
   class MotionDatabaseBasesView extends BasesView {
-    constructor(controller, containerEl) {
+    type = 'motion-database-query';
+    containerEl: HTMLElement;
+    renderVersion: number;
+
+    constructor(controller: QueryController, containerEl: HTMLElement) {
       super(controller);
-      this.type = 'motion-database-query';
       this.containerEl = containerEl.createDiv({ cls: 'mdb-bases-view' });
       this.renderVersion = 0;
       this.registerEvent(plugin.app.workspace.on('motion-database:changed', () => this.onDataUpdated()));
     }
 
-    onDataUpdated() {
+    onDataUpdated(): void {
       void this.renderDatabaseQuery();
     }
 
-    async renderDatabaseQuery() {
+    async renderDatabaseQuery(): Promise<void> {
       const version = ++this.renderVersion;
     const databaseValue: unknown = this.config.get('database');
     const sqlValue: unknown = this.config.get('sql');
@@ -5727,7 +6236,7 @@ function registerBasesIntegration(plugin) {
         loading.remove();
         this.containerEl.createDiv({
           cls: 'mdb-query-error',
-          text: error?.message || String(error),
+          text: errorMessage(error),
         });
       }
     }
@@ -5757,6 +6266,8 @@ function registerBasesIntegration(plugin) {
 
 
 module.exports = class MotionDatabasePlugin extends Plugin {
+  databases: Map<string, MotionDB>;
+
   onload() {
     this.databases = new Map();
     this.registerView(VIEW_TYPE, leaf => new MotionDatabaseView(leaf, this));
@@ -5803,7 +6314,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       window.setTimeout(() => {
         this.app.workspace.getLeavesOfType(VIEW_TYPE).forEach(leaf => {
-          if (!leaf.view?.db) leaf.detach();
+          if (!isMotionDatabaseView(leaf.view) || !leaf.view.db) leaf.detach();
         });
       }, 300);
     });
@@ -5821,7 +6332,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     });
   }
 
-  async getDatabase(filePath) {
+  async getDatabase(filePath: string): Promise<MotionDB> {
     const key = filePath.replace(/\\/g, '/');
     let db = this.databases.get(key);
     if (db) {
@@ -5843,14 +6354,14 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     }
   }
 
-  registerDatabase(db) {
+  registerDatabase(db: MotionDB): MotionDB {
     const key = db.filePath.replace(/\\/g, '/');
     this.databases.set(key, db);
     if (window._motionDBRegistry) window._motionDBRegistry[db.name] = db;
     return db;
   }
 
-  async deleteDatabase(filePath) {
+  async deleteDatabase(filePath: string): Promise<void> {
     const key = filePath.replace(/\\/g, '/');
     const db = this.databases.get(key);
     if (db) {
@@ -5872,12 +6383,12 @@ module.exports = class MotionDatabasePlugin extends Plugin {
   }
 
   // Open (or reveal) the Home view — always a single tab
-  async openHome() {
+  async openHome(): Promise<void> {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_HOME);
     if (existing.length > 0) {
       await this.app.workspace.revealLeaf(existing[0]);
       try {
-        if (existing[0].view?.render) await existing[0].view.render();
+        if (isMotionDatabaseHomeView(existing[0].view)) await existing[0].view.render();
       } catch (error) {
         console.error('[MotionDB] Could not refresh the home view:', error);
       }
@@ -5888,24 +6399,22 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     await this.app.workspace.revealLeaf(leaf);
   }
 
-  async openInLeaf(filePath) {
+  async openInLeaf(filePath: string): Promise<void> {
     // Check if this exact database is already open — reveal it if so
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     for (const leaf of existing) {
-      if (leaf.view?.db?.filePath === filePath) {
+      if (isMotionDatabaseView(leaf.view) && leaf.view.db?.filePath === filePath) {
         await this.app.workspace.revealLeaf(leaf);
         return;
       }
     }
     // Reuse an already-open but unloaded DB leaf instead of spawning a new tab
-    const emptyLeaf = existing.find(leaf => !leaf.view?.db);
+    const emptyLeaf = existing.find(leaf => isMotionDatabaseView(leaf.view) && !leaf.view.db);
     const leaf = emptyLeaf || this.app.workspace.getLeaf('tab');
     if (!emptyLeaf) {
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
     await this.app.workspace.revealLeaf(leaf);
-    if (leaf.view?.loadDB) {
-      await leaf.view.loadDB(filePath);
-    }
+    if (isMotionDatabaseView(leaf.view)) await leaf.view.loadDB(filePath);
   }
 };
