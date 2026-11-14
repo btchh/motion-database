@@ -1,5 +1,5 @@
-# Motion Database 2.3.6
+# Motion Database 2.3.7
 
-- Replace the blanket TypeScript check suppression with typed SQL parsing, database operations, public API, and Obsidian view callbacks.
-- Validate persisted database structures and normalize older saved SELECT query shapes when loading them.
-- Build and publish release assets through the repository's attestation-enabled GitHub Actions workflow.
+- Fix remaining Obsidian code review warnings for async confirmation actions, embedded property edits, cross-window input checks, and SVG typing.
+- Remove unused type and API declarations.
+- Keep database loading checks explicit so pending loads are awaited safely.

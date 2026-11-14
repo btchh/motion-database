@@ -1,7 +1,6 @@
 import {
   BasesView,
   App,
-  Editor,
   ItemView,
   MarkdownRenderChild,
   Modal,
@@ -160,17 +159,6 @@ interface MotionDatabasePluginAPI extends Plugin {
   openInLeaf(filePath: string): Promise<void>;
 }
 
-interface MotionDBAPI {
-  create(name: string): Promise<MotionDB>;
-  open(name: string): Promise<MotionDB>;
-  query(dbName: string, sql: string, parameters?: unknown[]): Promise<SqlResult[]>;
-  select(dbName: string, sql: string, parameters?: unknown[]): Promise<DbRow[]>;
-  list(): Promise<Array<{ name: string; tables: string[] }>>;
-  exec(db: MotionDB, sql: string, parameters?: unknown[]): Promise<SqlResult[]>;
-  seed(dbName: string): Promise<{ ok: number; errors: Array<{ type: 'error'; message: string }> }>;
-  version: number;
-  subscribe(callback: (change: { name: string; filePath: string }) => void): () => void;
-}
 type PropertyFormat =
   | { type: 'text' | 'default' | 'checkbox' | 'image' | 'media' }
   | { type: 'progress'; max?: number }
@@ -3839,7 +3827,7 @@ class MotionDatabaseView extends ItemView {
 
     const ns = 'http://www.w3.org/2000/svg';
     const mk = <K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, string | number> = {}): SVGElementTagNameMap[K] => {
-      const element = document.createElementNS(ns, tag) as SVGElementTagNameMap[K];
+      const element = document.createElementNS(ns, tag);
       Object.entries(attrs).forEach(([key, value]) => element.setAttribute(key, String(value)));
       return element;
     };
@@ -5013,7 +5001,7 @@ class MotionDatabaseView extends ItemView {
     doInsertBtn.onclick = () => doInsert(true);
 
     // Tab from last editable insert input → triggers insert and loops back
-    const insertInputs = tbl.columns.filter(c => !c.ai).map(c => insertInputMap[c.name]).filter((input): input is HTMLInputElement => input instanceof HTMLInputElement);
+    const insertInputs = tbl.columns.filter(c => !c.ai).map(c => insertInputMap[c.name]).filter((input): input is HTMLInputElement => input.instanceOf(HTMLInputElement));
     insertInputs.forEach((inp, idx) => {
       inp.onkeydown = e => {
         if (e.key === 'Enter') {
@@ -5334,16 +5322,30 @@ class StructureModal extends Modal {
 
 class ConfirmModal extends Modal {
   message: string;
-  onConfirm: () => void;
+  onConfirm: () => void | Promise<void>;
   onCancel: (() => void) | null;
+  private confirming = false;
 
-  constructor(app: App, message: string, onConfirm: () => void, onCancel?: () => void) { super(app); this.message = message; this.onConfirm = onConfirm; this.onCancel = onCancel || null; }
+  constructor(app: App, message: string, onConfirm: () => void | Promise<void>, onCancel?: () => void) { super(app); this.message = message; this.onConfirm = onConfirm; this.onCancel = onCancel || null; }
+  private async confirm(): Promise<void> {
+    if (this.confirming) return;
+    this.confirming = true;
+    try {
+      await this.onConfirm();
+      this.close();
+    } catch (error) {
+      new Notice(`Action failed: ${errorMessage(error)}`);
+    } finally {
+      this.confirming = false;
+    }
+  }
+
   onOpen() {
     this.modalEl.addClass('mdb-modal', 'mdb-confirm-modal');
     this.setTitle('Confirm action');
     this.contentEl.createEl('p', { cls: 'mdb-confirm-message', text: this.message });
     const actions = new Setting(this.contentEl)
-      .addButton(b => b.setButtonText('Confirm').setDestructive().onClick(() => { this.onConfirm(); this.close(); }))
+      .addButton(b => b.setButtonText('Confirm').setDestructive().onClick(() => { void this.confirm(); }))
       .addButton(b => b.setButtonText('Cancel').onClick(() => { this.onCancel?.(); this.close(); }));
     installModalFooter(this.contentEl, actions);
   }
@@ -5898,20 +5900,22 @@ function renderQueryResults(containerEl: HTMLElement, results: SqlResult[], opti
         td.setAttribute('tabindex', '0');
         td.setAttribute('aria-label', `Edit ${result.columns[columnIndex]}`);
         if (format.type === 'checkbox' || (format.type === 'rating' && format.style !== 'number')) {
+          const applyEdit = async (nextValue: unknown): Promise<void> => {
+            if (!options.onEdit) return;
+            try {
+              await options.onEdit(rowIndex, columnIndex, nextValue);
+              value = nextValue;
+              if (td.isConnected) renderInteractiveProperty();
+            } catch (error) {
+              if (td.isConnected) renderInteractiveProperty();
+              new Notice(errorMessage(error));
+            }
+          };
           const renderInteractiveProperty = () => renderEmbedPropertyValue(td, value, format, {
             app: options.app,
             sourcePath: options.sourcePath,
             editable: true,
-            onChange: async nextValue => {
-              try {
-                await options.onEdit(rowIndex, columnIndex, nextValue);
-                value = nextValue;
-                if (td.isConnected) renderInteractiveProperty();
-              } catch (error) {
-                if (td.isConnected) renderInteractiveProperty();
-                new Notice(errorMessage(error));
-              }
-            },
+            onChange: nextValue => { void applyEdit(nextValue); },
           });
           renderInteractiveProperty();
           return;
@@ -6336,7 +6340,7 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     const key = filePath.replace(/\\/g, '/');
     let db = this.databases.get(key);
     if (db) {
-      if (db._loadPromise) await db._loadPromise;
+      if (db._loadPromise !== null) await db._loadPromise;
       return db;
     }
 

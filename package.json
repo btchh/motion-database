@@ -1,6 +1,6 @@
 {
   "name": "motion-database-plugin",
-  "version": "2.3.6",
+  "version": "2.3.7",
   "description": "A local-first relational database for Obsidian.",
   "main": "main.js",
   "scripts": {
