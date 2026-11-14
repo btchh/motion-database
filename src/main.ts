@@ -5792,8 +5792,8 @@ module.exports = class MotionDatabasePlugin extends Plugin {
     this.registerMarkdownCodeBlockProcessor('motiondb', (source, el, context) => {
       context.addChild(new MotionDatabaseEmbed(el, this, source, context.sourcePath));
     });
-    this.addCommand({ id: 'mdb-home', name: 'Motion Database: Home', callback: () => this.openHome() });
-    this.addCommand({ id: 'mdb-open', name: 'Motion Database: Open or create', callback: () => this.openHome() });
+    this.addCommand({ id: 'mdb-home', name: 'Home', callback: () => this.openHome() });
+    this.addCommand({ id: 'mdb-open', name: 'Open or create', callback: () => this.openHome() });
     this.addCommand({
       id: 'prefix-selected-lines-blockquote',
       name: 'Editor: Prefix selected lines with blockquote',
