@@ -4814,7 +4814,10 @@ class StructureModal extends Modal {
     contentEl.createEl('h3', { cls: 'mdb-modal-section', text: 'Add Column' });
     let addName = '', addType = 'TEXT', addNotNull = false, addDefault = '', addPresentation = 'default', addRatingMax = 5;
     new Setting(contentEl).setName('Column name').addText(t => t.onChange(v => addName = v.trim().toLowerCase()));
-    new Setting(contentEl).setName('Type').addDropdown(dd => { ['INTEGER', 'BOOLEAN', 'TEXT', 'REAL', 'DATE', 'BLOB'].forEach(t => dd.addOption(t, t)); dd.onChange(v => { addType = v; if (v === 'BOOLEAN') addPresentation = 'checkbox'; }); });
+    new Setting(contentEl).setName('Type').addDropdown(dd => {
+      ['INTEGER', 'BOOLEAN', 'TEXT', 'REAL', 'DATE', 'BLOB'].forEach(t => { dd.addOption(t, t); });
+      dd.onChange(v => { addType = v; if (v === 'BOOLEAN') addPresentation = 'checkbox'; });
+    });
     new Setting(contentEl).setName('Presentation').setDesc('How the stored value is displayed and edited.').addDropdown(dd => dd
       .addOption('default', 'Default value')
       .addOption('checkbox', 'Checkbox (Boolean)')
