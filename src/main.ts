@@ -5443,7 +5443,7 @@ class MotionDatabaseHomeView extends ItemView {
     titleWrap.createDiv({ cls: 'mdb-home-subtitle', text: 'Databases stored in this vault' });
     const localStatus = header.createDiv({ cls: 'mdb-home-local-status' });
     setIcon(localStatus, 'hard-drive');
-    localStatus.createSpan({ text: 'Local' });
+    localStatus.createSpan({ text: 'Stored locally' });
 
     // ── Body ──
     const body = home.createDiv({ cls: 'mdb-home-body' });
@@ -5454,10 +5454,10 @@ class MotionDatabaseHomeView extends ItemView {
 
     const hero = body.createDiv({ cls: 'mdb-home-hero' });
     const heroIntro = hero.createDiv({ cls: 'mdb-home-hero-intro' });
-    heroIntro.createEl('h2', { cls: 'mdb-home-hero-title', text: 'Overview' });
+    heroIntro.createEl('h2', { cls: 'mdb-home-hero-title', text: 'Manage your databases' });
     heroIntro.createEl('p', {
       cls: 'mdb-home-hero-copy',
-      text: 'Create and manage relational databases without leaving your vault.',
+      text: 'Create a database here, or open one below to browse tables and run queries.',
     });
 
     const metrics = heroIntro.createDiv({ cls: 'mdb-home-metrics' });
@@ -5481,7 +5481,7 @@ class MotionDatabaseHomeView extends ItemView {
       const libraryHeader = body.createDiv({ cls: 'mdb-home-library-header' });
       const libraryTitle = libraryHeader.createDiv({ cls: 'mdb-home-library-title-wrap' });
       libraryTitle.createEl('h2', { cls: 'mdb-home-library-title', text: 'Your databases' });
-      libraryTitle.createDiv({ cls: 'mdb-home-library-subtitle', text: 'Recently modified databases appear first.' });
+      libraryTitle.createDiv({ cls: 'mdb-home-library-subtitle', text: 'Open a database to work with its tables and queries.' });
       libraryHeader.createSpan({ cls: 'mdb-home-library-count', text: String(databases.length) });
       const grid = body.createDiv({ cls: 'mdb-home-grid' });
 
@@ -5556,31 +5556,37 @@ class MotionDatabaseHomeView extends ItemView {
         addStat(dbInfo.rows, 'Rows');
         addStat(dbInfo.views, 'Views');
 
-        // Last modified
         if (dbInfo.mtime) {
-          const d = new Date(dbInfo.mtime);
-          top.createDiv({ cls: 'mdb-db-card-time', text: 'Modified ' + d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' at ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) });
+          const modified = new Date(dbInfo.mtime);
+          const modifiedTime = nameWrap.createEl('time', {
+            cls: 'mdb-db-card-time',
+            text: `Updated ${modified.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`,
+          });
+          modifiedTime.dateTime = modified.toISOString();
         }
 
         // Actions
         const actions = card.createDiv({ cls: 'mdb-db-card-actions' });
 
-        const openBtn = actions.createEl('button', { cls: 'mdb-db-card-action primary' });
+        const openBtn = actions.createEl('button', { cls: 'mdb-db-card-action mod-cta' });
         setIcon(openBtn, 'folder-open');
-        openBtn.createSpan({ text: 'Open' });
+        openBtn.createSpan({ text: 'Open database' });
         openBtn.setAttribute('aria-label', `Open ${dbInfo.name}`);
+        openBtn.title = `Open database: ${dbInfo.name}`;
         openBtn.onclick = () => this.plugin.openInLeaf(dbInfo.filePath);
 
-        const renameBtn = actions.createEl('button', { cls: 'clickable-icon mdb-db-card-action' });
+        const renameBtn = actions.createEl('button', { cls: 'mdb-db-card-action' });
         setIcon(renameBtn, 'pencil');
         renameBtn.createSpan({ text: 'Rename' });
         renameBtn.setAttribute('aria-label', `Rename ${dbInfo.name}`);
+        renameBtn.title = `Rename ${dbInfo.name}`;
         renameBtn.onclick = async () => { this.renaming = dbInfo.filePath; await this.render(); };
 
-        const deleteBtn = actions.createEl('button', { cls: 'clickable-icon mdb-db-card-action danger' });
+        const deleteBtn = actions.createEl('button', { cls: 'mdb-db-card-action danger' });
         setIcon(deleteBtn, 'trash-2');
         deleteBtn.createSpan({ text: 'Delete' });
         deleteBtn.setAttribute('aria-label', `Delete ${dbInfo.name}`);
+        deleteBtn.title = `Delete ${dbInfo.name}`;
         deleteBtn.onclick = () => {
           new ConfirmModal(this.app, `Delete "${dbInfo.name}"? This permanently removes the database file and cannot be undone.`, async () => {
             try {
@@ -5615,11 +5621,12 @@ class MotionDatabaseHomeView extends ItemView {
     const form = createSection.createDiv({ cls: 'mdb-new-db-form' });
 
     const formRow = form.createDiv({ cls: 'mdb-new-db-form-row' });
-    const nameInput = formRow.createEl('input', { cls: 'mdb-new-db-input', placeholder: 'Name your database…' });
+    const nameInput = formRow.createEl('input', { cls: 'mdb-new-db-input', placeholder: 'e.g. Project tracker' });
     nameInput.type = 'text';
+    nameInput.setAttribute('aria-label', 'Database name');
 
     const createBtn = formRow.createEl('button', { cls: 'mdb-btn-create mod-cta' });
-    setButtonContent(createBtn, 'plus', 'Create');
+    setButtonContent(createBtn, 'plus', 'Create database');
     createBtn.disabled = true;
     nameInput.oninput = () => { createBtn.disabled = nameInput.value.trim().length === 0; };
 
@@ -5642,7 +5649,7 @@ class MotionDatabaseHomeView extends ItemView {
           new Notice(`A database named "${name}" already exists.`);
           createBtn.disabled = false;
           createBtn.removeClass('is-loading');
-          setButtonContent(createBtn, 'plus', 'Create');
+          setButtonContent(createBtn, 'plus', 'Create database');
           return;
         }
         const db = new MotionDB(this.plugin, fp);
@@ -5653,13 +5660,13 @@ class MotionDatabaseHomeView extends ItemView {
         await this.plugin.openInLeaf(fp);
         nameInput.value = '';
         createBtn.removeClass('is-loading');
-        setButtonContent(createBtn, 'plus', 'Create');
+        setButtonContent(createBtn, 'plus', 'Create database');
         await this.render();
       } catch (e) {
         new Notice(`Failed to create database: ${errorMessage(e)}`);
         createBtn.disabled = false;
         createBtn.removeClass('is-loading');
-        setButtonContent(createBtn, 'plus', 'Create');
+        setButtonContent(createBtn, 'plus', 'Create database');
       }
     };
 

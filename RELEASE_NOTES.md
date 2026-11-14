@@ -1,5 +1,5 @@
-# Motion Database 2.3.7
+# Motion Database 2.3.8
 
-- Fix remaining Obsidian code review warnings for async confirmation actions, embedded property edits, cross-window input checks, and SVG typing.
-- Remove unused type and API declarations.
-- Keep database loading checks explicit so pending loads are awaited safely.
+- Refresh the database home screen with clearer onboarding copy, a more readable database list, and visible Open database, Rename, and Delete labels.
+- Move each database's update time under its name so it wraps cleanly instead of colliding with actions.
+- Use Obsidian's native call-to-action button styling for database creation and opening.
