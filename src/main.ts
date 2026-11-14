@@ -3527,7 +3527,7 @@ class MotionDatabaseView extends ItemView {
     titleEl.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); titleEl.blur(); } };
 
     const layout = root.createDiv({ cls: 'mdb-layout' });
-    const sidebar = layout.createDiv({ cls: 'mdb-sidebar' });
+    const sidebar = layout.createDiv({ cls: 'mdb-sidebar vertical-tab-header' });
     const content = layout.createDiv({ cls: 'mdb-content' });
 
     // Match Obsidian's Settings navigation semantics and visual tokens rather
@@ -3545,9 +3545,11 @@ class MotionDatabaseView extends ItemView {
       };
       return el;
     };
-    const navItem = (label: string, icon: string, id: string): HTMLDivElement => {
+    const databaseGroup = sidebar.createDiv({ cls: 'vertical-tab-header-group' });
+    databaseGroup.createDiv({ cls: 'vertical-tab-header-group-title', text: 'Database' });
+    const navItem = (parent: HTMLElement, label: string, icon: string, id: string): HTMLDivElement => {
       const isActive = this.activeTab === id;
-      const el = sidebarItem(sidebar, isActive ? 'is-active' : '', () => {
+      const el = sidebarItem(parent, isActive ? 'is-active' : '', () => {
         this.activeTab = id;
         this.render();
       });
@@ -3558,14 +3560,18 @@ class MotionDatabaseView extends ItemView {
       return el;
     };
 
-    navItem('Overview', 'layout-dashboard', 'dashboard');
-    navItem('Tables', 'table-2', 'tables');
-    navItem('SQL', 'square-terminal', 'sql');
-    navItem('Relationships', 'workflow', 'erd');
-    navItem('SQL reference', 'book-open', 'cheatsheet');
+    navItem(databaseGroup, 'Overview', 'layout-dashboard', 'dashboard');
+    navItem(databaseGroup, 'Tables', 'table-2', 'tables');
+
+    const toolsGroup = sidebar.createDiv({ cls: 'vertical-tab-header-group' });
+    toolsGroup.createDiv({ cls: 'vertical-tab-header-group-title', text: 'Tools' });
+    navItem(toolsGroup, 'SQL', 'square-terminal', 'sql');
+    navItem(toolsGroup, 'Relationships', 'workflow', 'erd');
+    navItem(toolsGroup, 'SQL reference', 'book-open', 'cheatsheet');
 
     // New table and CSV actions sit below the native vertical navigation.
-    const sidebarActions = sidebar.createDiv({ cls: 'mdb-sidebar-actions' });
+    const sidebarActions = sidebar.createDiv({ cls: 'vertical-tab-header-group mdb-sidebar-actions' });
+    sidebarActions.createDiv({ cls: 'vertical-tab-header-group-title', text: 'Actions' });
     const newTblBtn = sidebarItem(sidebarActions, 'mdb-sidebar-action', () => {
       new NewTableModal(this.app, db, () => this.persistAndRender()).open();
     });
