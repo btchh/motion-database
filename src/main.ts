@@ -5404,20 +5404,144 @@ class ConfirmModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
+class NewDatabaseModal extends Modal {
+  plugin: MotionDatabasePluginAPI;
+  existingNames: string[];
+  onCreated: () => Promise<void>;
+
+  constructor(app: App, plugin: MotionDatabasePluginAPI, existingNames: string[], onCreated: () => Promise<void>) {
+    super(app);
+    this.plugin = plugin;
+    this.existingNames = existingNames;
+    this.onCreated = onCreated;
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass('mdb-modal', 'mdb-new-database-modal');
+    this.setTitle('Create database');
+
+    const { contentEl } = this;
+    contentEl.createEl('p', {
+      cls: 'mdb-modal-description',
+      text: `Create a local database in this vault. Its file will be saved in ${DB_DIR}/.`,
+    });
+
+    let databaseName = '';
+    let creating = false;
+    let nameInput: HTMLInputElement | null = null;
+    let createButton: HTMLButtonElement | null = null;
+
+    const status = contentEl.createDiv({ cls: 'mdb-new-database-status', attr: { role: 'status', 'aria-live': 'polite' } });
+    status.hidden = true;
+    const showError = (message: string): void => {
+      status.setText(message);
+      status.addClass('is-error');
+      status.hidden = false;
+    };
+    const setBusy = (busy: boolean): void => {
+      creating = busy;
+      if (!createButton) return;
+      createButton.disabled = busy || !nameInput?.value.trim();
+      setButtonContent(createButton, busy ? 'loader-circle' : 'plus', busy ? 'Creating…' : 'Create database');
+      createButton.toggleClass('is-loading', busy);
+    };
+
+    const createDatabase = async (): Promise<void> => {
+      if (creating) return;
+      databaseName = nameInput?.value.trim() || '';
+      if (!databaseName) {
+        showError('Enter a database name.');
+        nameInput?.focus();
+        return;
+      }
+      if (this.existingNames.some(name => name.toLocaleLowerCase() === databaseName.toLocaleLowerCase())) {
+        showError(`A database named “${databaseName}” already exists.`);
+        nameInput?.focus();
+        nameInput?.select();
+        return;
+      }
+
+      const fileName = databaseName.replace(/[\\/:*?"<>|]/g, '_');
+      const filePath = `${DB_DIR}/${fileName}.motiondb.json`;
+      status.hidden = true;
+      status.removeClass('is-error');
+      setBusy(true);
+
+      let created = false;
+      try {
+        if (await this.plugin.app.vault.adapter.exists(filePath)) {
+          throw new Error(`A database file named “${fileName}” already exists.`);
+        }
+        const db = new MotionDB(this.plugin, filePath);
+        db.name = databaseName;
+        await db.save();
+        this.plugin.registerDatabase(db);
+        created = true;
+      } catch (error) {
+        showError(`Could not create database: ${errorMessage(error)}`);
+      } finally {
+        if (!created) setBusy(false);
+      }
+      if (!created) return;
+
+      this.close();
+      new Notice(`“${databaseName}” created`);
+      try {
+        await this.plugin.openInLeaf(filePath);
+      } catch (error) {
+        new Notice(`Database created, but could not be opened: ${errorMessage(error)}`);
+      }
+      try {
+        await this.onCreated();
+      } catch (error) {
+        console.error('[MotionDB] Could not refresh the database list:', error);
+      }
+    };
+
+    new Setting(contentEl)
+      .setName('Database name')
+      .setDesc('Choose a name you will recognize in this vault.')
+      .addText(text => {
+        nameInput = text.inputEl;
+        text.setPlaceholder('e.g. Project tracker').onChange(value => {
+          databaseName = value.trim();
+          status.hidden = true;
+          status.removeClass('is-error');
+          if (createButton) createButton.disabled = creating || databaseName.length === 0;
+        });
+        text.inputEl.focus();
+        text.inputEl.addEventListener('keydown', event => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            void createDatabase();
+          }
+        });
+      });
+
+    const actions = new Setting(contentEl)
+      .addButton(button => {
+        button.setButtonText('Create database').setCta().onClick(() => { void createDatabase(); });
+        createButton = button.buttonEl;
+        createButton.disabled = true;
+        createButton.setAttribute('type', 'button');
+      })
+      .addButton(button => button.setButtonText('Cancel').onClick(() => this.close()));
+    installModalFooter(contentEl, actions);
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
+
 // ── Home View ──────────────────────────────────────────────────────────────────
 
 class MotionDatabaseHomeView extends ItemView {
   plugin: MotionDatabasePluginAPI;
-  creating: boolean;
-  newName: string;
   renaming: string | null;
   file: { name: string; path: string; extension: string };
 
   constructor(leaf: WorkspaceLeaf, plugin: MotionDatabasePluginAPI) {
     super(leaf);
     this.plugin = plugin;
-    this.creating = false;
-    this.newName = '';
     this.renaming = null;
     // Stub for third-party plugins that read activeLeaf.view.file.name
     this.file = { name: 'Motion Database', path: '', extension: '' };
@@ -5493,65 +5617,56 @@ class MotionDatabaseHomeView extends ItemView {
     const titleWrap = header.createDiv({ cls: 'mdb-home-title-wrap' });
     titleWrap.createEl('h1', { cls: 'mdb-home-title', text: 'Motion Database' });
     titleWrap.createDiv({ cls: 'mdb-home-subtitle', text: 'Databases stored in this vault' });
-    const localStatus = header.createDiv({ cls: 'mdb-home-local-status' });
-    setIcon(localStatus, 'hard-drive');
-    localStatus.createSpan({ text: 'Stored locally' });
-
     // ── Body ──
     const body = home.createDiv({ cls: 'mdb-home-body' });
 
     const totalTables = databases.reduce((sum, database) => sum + database.tables, 0);
     const totalRows = databases.reduce((sum, database) => sum + database.rows, 0);
-    const totalViews = databases.reduce((sum, database) => sum + database.views, 0);
 
-    const hero = body.createDiv({ cls: 'mdb-home-hero' });
-    const heroIntro = hero.createDiv({ cls: 'mdb-home-hero-intro' });
-    heroIntro.createEl('h2', { cls: 'mdb-home-hero-title', text: 'Manage your databases' });
-    heroIntro.createEl('p', {
-      cls: 'mdb-home-hero-copy',
-      text: 'Create a database here, or open one below to browse tables and run queries.',
-    });
+    const pageHeader = body.createDiv({ cls: 'mdb-home-page-header' });
+    const pageIntro = pageHeader.createDiv({ cls: 'mdb-home-page-intro' });
+    pageIntro.createEl('h2', { cls: 'mdb-home-library-title', text: 'Your databases' });
+    if (databases.length > 0) {
+      pageIntro.createDiv({
+        cls: 'mdb-home-summary',
+        text: `${databases.length} ${databases.length === 1 ? 'database' : 'databases'} · ${totalTables} ${totalTables === 1 ? 'table' : 'tables'} · ${totalRows} ${totalRows === 1 ? 'row' : 'rows'}`,
+      });
+    }
 
-    const metrics = heroIntro.createDiv({ cls: 'mdb-home-metrics' });
-    const addMetric = (icon: string, value: number, label: string) => {
-      const metric = metrics.createDiv({ cls: 'mdb-home-metric' });
-      const metricIcon = metric.createSpan({ cls: 'mdb-home-metric-icon' });
-      setIcon(metricIcon, icon);
-      const metricText = metric.createDiv({ cls: 'mdb-home-metric-text' });
-      metricText.createDiv({ cls: 'mdb-home-metric-value', text: String(value) });
-      metricText.createDiv({ cls: 'mdb-home-metric-label', text: label });
-    };
-    addMetric('database', databases.length, databases.length === 1 ? 'Database' : 'Databases');
-    addMetric('table-2', totalTables, totalTables === 1 ? 'Table' : 'Tables');
-    addMetric('rows-3', totalRows, totalRows === 1 ? 'Row' : 'Rows');
-    if (totalViews) addMetric('eye', totalViews, totalViews === 1 ? 'View' : 'Views');
-
-    const createSection = hero.createDiv({ cls: 'mdb-create-section' });
+    const openCreateModal = () => new NewDatabaseModal(
+      this.app,
+      this.plugin,
+      databases.map(database => database.name),
+      async () => this.render(),
+    ).open();
+    const createDatabaseButton = pageHeader.createEl('button', { cls: 'mdb-home-create-button mod-cta' });
+    createDatabaseButton.type = 'button';
+    setButtonContent(createDatabaseButton, 'plus', 'Create database');
+    createDatabaseButton.onclick = openCreateModal;
 
     // ── Database grid ──
     if (databases.length > 0) {
-      const libraryHeader = body.createDiv({ cls: 'mdb-home-library-header' });
-      const libraryTitle = libraryHeader.createDiv({ cls: 'mdb-home-library-title-wrap' });
-      libraryTitle.createEl('h2', { cls: 'mdb-home-library-title', text: 'Your databases' });
-      libraryTitle.createDiv({ cls: 'mdb-home-library-subtitle', text: 'Open a database to work with its tables and queries.' });
-      libraryHeader.createSpan({ cls: 'mdb-home-library-count', text: String(databases.length) });
       const grid = body.createDiv({ cls: 'mdb-home-grid' });
 
       databases.forEach(dbInfo => {
-        const card = grid.createDiv({ cls: 'mdb-db-card' });
-        const top = card.createDiv({ cls: 'mdb-db-card-top' });
+        const modified = dbInfo.mtime ? new Date(dbInfo.mtime) : null;
+        const description = [
+          `${dbInfo.tables} ${dbInfo.tables === 1 ? 'table' : 'tables'}`,
+          `${dbInfo.rows} ${dbInfo.rows === 1 ? 'row' : 'rows'}`,
+          `${dbInfo.views} ${dbInfo.views === 1 ? 'view' : 'views'}`,
+          dbInfo.filePath.split('/').pop(),
+          modified ? `Updated ${modified.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}` : null,
+        ].filter(Boolean).join(' · ');
+        const setting = new Setting(grid)
+          .setClass('mdb-database-setting')
+          .setName(dbInfo.name)
+          .setDesc(description);
 
-        const iconRow = top.createDiv({ cls: 'mdb-db-card-icon-row' });
-        const databaseIcon = iconRow.createDiv({ cls: 'mdb-db-card-db-icon' });
-        setIcon(databaseIcon, 'database');
-
-        const nameWrap = iconRow.createDiv({ cls: 'mdb-db-card-name-wrap' });
-
-        // Name — editable inline if renaming
         if (this.renaming === dbInfo.filePath) {
-          const nameInput = nameWrap.createEl('input', { cls: 'mdb-db-rename-input' });
+          setting.nameEl.empty();
+          const nameInput = setting.nameEl.createEl('input', { cls: 'mdb-db-rename-input' });
           nameInput.value = dbInfo.name;
-          nameInput.type = 'text';
+          nameInput.setAttribute('aria-label', `Rename ${dbInfo.name}`);
           window.setTimeout(() => { nameInput.focus(); nameInput.select(); }, 30);
 
           let renameHandled = false;
@@ -5562,6 +5677,9 @@ class MotionDatabaseHomeView extends ItemView {
             if (!newName || newName === dbInfo.name) { this.renaming = null; await this.render(); return; }
             if (databases.some(other => other.filePath !== dbInfo.filePath && other.name.toLowerCase() === newName.toLowerCase())) {
               new Notice(`A database named “${newName}” already exists.`);
+              renameHandled = false;
+              nameInput.focus();
+              nameInput.select();
               return;
             }
             try {
@@ -5579,155 +5697,61 @@ class MotionDatabaseHomeView extends ItemView {
                 window._motionDBRegistry[newName] = db;
               }
               new Notice(`Renamed to "${newName}"`);
-            } catch (e) { new Notice(`Rename failed: ${errorMessage(e)}`); }
+            } catch (error) { new Notice(`Rename failed: ${errorMessage(error)}`); }
             this.renaming = null;
             await this.render();
           };
 
-          nameInput.onblur = doRename;
-          nameInput.onkeydown = e => {
-            if (e.key === 'Enter') { e.preventDefault(); nameInput.blur(); }
-            if (e.key === 'Escape') {
+          nameInput.onblur = () => { void doRename(); };
+          nameInput.onkeydown = event => {
+            if (event.key === 'Enter') { event.preventDefault(); nameInput.blur(); }
+            if (event.key === 'Escape') {
               this.renaming = null;
               void this.render().catch(error => console.error('[MotionDB] Could not refresh home view:', error));
             }
           };
-          nameWrap.createDiv({ cls: 'mdb-db-card-path', text: dbInfo.filePath.split('/').pop() });
-        } else {
-          nameWrap.createDiv({ cls: 'mdb-db-card-name', text: dbInfo.name });
-          nameWrap.createDiv({ cls: 'mdb-db-card-path', text: dbInfo.filePath.split('/').pop() });
-        }
-        // Stats
-        const stats = top.createDiv({ cls: 'mdb-db-card-stats' });
-        const addStat = (val: string | number, lbl: string): void => {
-          const s = stats.createDiv({ cls: 'mdb-db-stat' });
-          s.createDiv({ cls: 'mdb-db-stat-val', text: String(val) });
-          s.createDiv({ cls: 'mdb-db-stat-lbl', text: lbl });
-        };
-        addStat(dbInfo.tables, 'Tables');
-        addStat(dbInfo.rows, 'Rows');
-        addStat(dbInfo.views, 'Views');
-
-        if (dbInfo.mtime) {
-          const modified = new Date(dbInfo.mtime);
-          const modifiedTime = nameWrap.createEl('time', {
-            cls: 'mdb-db-card-time',
-            text: `Updated ${modified.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`,
-          });
-          modifiedTime.dateTime = modified.toISOString();
         }
 
-        // Actions
-        const actions = card.createDiv({ cls: 'mdb-db-card-actions' });
-
-        const openBtn = actions.createEl('button', { cls: 'mdb-db-card-action mod-cta' });
-        setIcon(openBtn, 'folder-open');
-        openBtn.createSpan({ text: 'Open database' });
-        openBtn.setAttribute('aria-label', `Open ${dbInfo.name}`);
-        openBtn.title = `Open database: ${dbInfo.name}`;
-        openBtn.onclick = () => this.plugin.openInLeaf(dbInfo.filePath);
-
-        const renameBtn = actions.createEl('button', { cls: 'mdb-db-card-action' });
-        setIcon(renameBtn, 'pencil');
-        renameBtn.createSpan({ text: 'Rename' });
-        renameBtn.setAttribute('aria-label', `Rename ${dbInfo.name}`);
-        renameBtn.title = `Rename ${dbInfo.name}`;
-        renameBtn.onclick = async () => { this.renaming = dbInfo.filePath; await this.render(); };
-
-        const deleteBtn = actions.createEl('button', { cls: 'mdb-db-card-action danger' });
-        setIcon(deleteBtn, 'trash-2');
-        deleteBtn.createSpan({ text: 'Delete' });
-        deleteBtn.setAttribute('aria-label', `Delete ${dbInfo.name}`);
-        deleteBtn.title = `Delete ${dbInfo.name}`;
-        deleteBtn.onclick = () => {
-          new ConfirmModal(this.app, `Delete "${dbInfo.name}"? This permanently removes the database file and cannot be undone.`, async () => {
-            try {
-              await this.plugin.deleteDatabase(dbInfo.filePath);
-              // Close any open leaf for this db
-              this.plugin.app.workspace.getLeavesOfType(VIEW_TYPE).forEach(leaf => {
-                if (isMotionDatabaseView(leaf.view) && leaf.view.db?.filePath === dbInfo.filePath) leaf.detach();
-              });
-              new Notice(`"${dbInfo.name}" deleted`);
-              await this.render();
-            } catch (e) { new Notice(`Delete failed: ${errorMessage(e)}`); }
-          }).open();
-        };
+        setting
+          .addButton(button => button
+            .setButtonText('Open')
+            .setIcon('folder-open')
+            .setCta()
+            .onClick(() => {
+              void this.plugin.openInLeaf(dbInfo.filePath).catch(error => new Notice(`Could not open database: ${errorMessage(error)}`));
+            }))
+          .addExtraButton(button => button
+            .setIcon('pencil')
+            .setTooltip(`Rename ${dbInfo.name}`)
+            .onClick(() => {
+              this.renaming = dbInfo.filePath;
+              void this.render();
+            }))
+          .addExtraButton(button => button
+            .setIcon('trash-2')
+            .setTooltip(`Delete ${dbInfo.name}`)
+            .onClick(() => {
+              new ConfirmModal(this.app, `Delete "${dbInfo.name}"? This permanently removes the database file and cannot be undone.`, async () => {
+                try {
+                  await this.plugin.deleteDatabase(dbInfo.filePath);
+                  this.plugin.app.workspace.getLeavesOfType(VIEW_TYPE).forEach(leaf => {
+                    if (isMotionDatabaseView(leaf.view) && leaf.view.db?.filePath === dbInfo.filePath) leaf.detach();
+                  });
+                  new Notice(`"${dbInfo.name}" deleted`);
+                  await this.render();
+                } catch (error) { new Notice(`Delete failed: ${errorMessage(error)}`); }
+              }).open();
+            }));
       });
     } else {
-      // Empty state shown inside the create section
       const empty = body.createDiv({ cls: 'mdb-home-empty' });
-      const emptyIcon = empty.createDiv({ cls: 'mdb-home-empty-icon' });
-      setIcon(emptyIcon, 'database');
-      empty.createDiv({ cls: 'mdb-home-empty-text', text: 'No databases yet' });
-      empty.createDiv({ cls: 'mdb-home-empty-sub', text: 'Create one above to get started.' });
+      empty.createEl('h3', { cls: 'mdb-home-empty-text', text: 'No databases yet' });
+      empty.createDiv({ cls: 'mdb-home-empty-sub', text: 'Create a local database to start organizing tables and queries.' });
+      const emptyCreateButton = empty.createEl('button', { cls: 'mod-cta' });
+      emptyCreateButton.type = 'button';
+      setButtonContent(emptyCreateButton, 'plus', 'Create database');
+      emptyCreateButton.onclick = openCreateModal;
     }
-
-    // ── Create new database ──
-    const createHeading = createSection.createDiv({ cls: 'mdb-create-heading' });
-    const createIcon = createHeading.createSpan({ cls: 'mdb-create-heading-icon' });
-    setIcon(createIcon, 'plus');
-    const createHeadingText = createHeading.createDiv();
-    createHeadingText.createDiv({ cls: 'mdb-create-section-title', text: 'New database' });
-    createHeadingText.createDiv({ cls: 'mdb-create-section-copy', text: 'Add a database to this vault.' });
-
-    const form = createSection.createDiv({ cls: 'mdb-new-db-form' });
-
-    const formRow = form.createDiv({ cls: 'mdb-new-db-form-row' });
-    const nameInput = formRow.createEl('input', { cls: 'mdb-new-db-input', placeholder: 'e.g. Project tracker' });
-    nameInput.type = 'text';
-    nameInput.setAttribute('aria-label', 'Database name');
-
-    const createBtn = formRow.createEl('button', { cls: 'mdb-btn-create mod-cta' });
-    setButtonContent(createBtn, 'plus', 'Create database');
-    createBtn.disabled = true;
-    nameInput.oninput = () => { createBtn.disabled = nameInput.value.trim().length === 0; };
-
-
-    const doCreate = async () => {
-      const name = nameInput.value.trim();
-      if (!name) return;
-      if (databases.some(database => database.name.toLowerCase() === name.toLowerCase())) {
-        new Notice(`A database named “${name}” already exists.`);
-        return;
-      }
-      createBtn.disabled = true;
-      setButtonContent(createBtn, 'loader-circle', 'Creating…');
-      createBtn.addClass('is-loading');
-      try {
-        const fp = `${DB_DIR}/${name.replace(/[\\/:*?"<>|]/g, '_')}.motiondb.json`;
-        // Check if already exists
-        const exists = await this.plugin.app.vault.adapter.exists(fp);
-        if (exists) {
-          new Notice(`A database named "${name}" already exists.`);
-          createBtn.disabled = false;
-          createBtn.removeClass('is-loading');
-          setButtonContent(createBtn, 'plus', 'Create database');
-          return;
-        }
-        const db = new MotionDB(this.plugin, fp);
-        db.name = name;
-        await db.save();
-        this.plugin.registerDatabase(db);
-        new Notice(`"${name}" created`);
-        await this.plugin.openInLeaf(fp);
-        nameInput.value = '';
-        createBtn.removeClass('is-loading');
-        setButtonContent(createBtn, 'plus', 'Create database');
-        await this.render();
-      } catch (e) {
-        new Notice(`Failed to create database: ${errorMessage(e)}`);
-        createBtn.disabled = false;
-        createBtn.removeClass('is-loading');
-        setButtonContent(createBtn, 'plus', 'Create database');
-      }
-    };
-
-    createBtn.onclick = doCreate;
-    nameInput.onkeydown = e => {
-      if (e.key === 'Enter' && !createBtn.disabled) {
-        void doCreate().catch(error => new Notice(`Could not create database: ${errorMessage(error)}`));
-      }
-    };
   }
 
   async onClose(): Promise<void> { this.containerEl.empty(); }

@@ -1,5 +1,5 @@
-# Motion Database 2.3.10
+# Motion Database 2.3.11
 
-- Fix table input creation that could throw a `HierarchyRequestError` when opening a table or entering edit mode.
-- Create SQL result elements inside their output container so running or restoring queries does not append elements to the document root.
-- Create temporary CSV controls and foreign-key autocomplete elements under valid DOM parents.
+- Replace the database home hero and inline creation form with a focused, theme-aware database list and a standard Obsidian modal for creating databases.
+- Use Obsidian setting rows and native Open, Rename, and Delete controls so the page follows the active theme.
+- Show the database storage folder and inline validation feedback in the creation dialog.
