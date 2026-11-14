@@ -1,262 +1,175 @@
-# Motion Database — DataviewJS Integration Guide
+# DataviewJS and Motion Database
 
-The plugin exposes a global `window.motiondb` API that any DataviewJS block can call.
-Databases are loaded on demand and do not need to be open in a panel first.
+Motion Database exposes `window.motiondb` while the plugin is enabled.
+DataviewJS provides `dv` for reading page metadata and rendering results. Use a
+`dataviewjs` code block to call Motion Database; a regular `dataview` block
+cannot call JavaScript APIs.
 
+## Requirements
+
+1. Install and enable Motion Database.
+2. Install and enable Dataview.
+3. In Dataview settings, enable **JavaScript queries**.
+
+DataviewJS runs JavaScript with access to your vault. Enable it only if you
+trust the scripts in your vault. See the [DataviewJS API overview](https://blacksmithgu.github.io/obsidian-dataview/api/intro/)
+and [code block reference](https://blacksmithgu.github.io/obsidian-dataview/api/code-reference/).
+
+## Quick start: create, query, render
+
+This block creates the `Reading Log` database if it does not exist, creates
+the table once, and renders books whose status matches the current note's
+`status` property. If that property is missing, it uses `reading`. Add or edit
+rows in the Motion Database view. The note can set its filter with YAML such
+as `status: reading`.
+
+````markdown
+---
+status: reading
 ---
 
-## API Reference
+```dataviewjs
+const databaseName = "Reading Log";
+const db = await window.motiondb.create(databaseName);
 
-### `motiondb.create(name)` → `Promise<MotionDB>`
+await db.query(`
+  CREATE TABLE IF NOT EXISTS books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'to-read'
+  )
+`);
+await db.flushSave();
 
-Creates a database for an embedded app and returns its open instance. If the
-same database is already open, its existing instance is returned.
-
-### `motiondb.open(name)` → `Promise<MotionDB>`
-Returns the database instance. Useful when you want to run several queries
-against the same db without repeating the name each time.
-
-Prefer `motiondb.query()` and `motiondb.select()` in DataviewJS. They persist
-writes before their promises resolve.
-
-### `motiondb.query(dbName, sql)` → `Promise<Result[]>`
-Raw exec. Returns an array of result objects (one per statement).
-Each result is either:
-- `{ type: 'rows', columns: string[], rows: any[][] }`
-- `{ type: 'ok', message: string, count: number }`
-
-PostgreSQL-style positional parameters are supported:
-```js
-const rows = await motiondb.select(
-  'mydb',
-  'SELECT * FROM users WHERE age >= $1 AND status = $2',
-  [18, 'active']
+const status = String(dv.current().status ?? "reading");
+const books = await window.motiondb.select(
+  databaseName,
+  "SELECT title, status FROM books WHERE status = $1 ORDER BY title",
+  [status]
 );
-```
 
-### `motiondb.select(dbName, sql)` → `Promise<Object[]>`
-Like `query` but returns plain row objects — much easier for DataviewJS tables.
-```js
-// Returns: [{ id: 1, name: 'Alice', score: 9.5 }, ...]
-const rows = await motiondb.select('mydb', 'SELECT * FROM users');
-```
-
-### `motiondb.list()` → `Promise<{ name, tables[] }[]>`
-Lists all databases and their tables.
-
-### `motiondb.seed(dbName)` → `Promise<{ ok, errors }>`
-Seeds the database with the built-in Northwind sample schema:
-`categories`, `suppliers`, `products`, `customers`, `orders`, `order_items`
-Plus two views: `order_totals`, `product_revenue`.
-
----
-
-## Quick Start
-
-### 1. Seed the sample database
-Run this once in any DataviewJS block to load the Northwind demo data:
-
-````js
-```dataviewjs
-const result = await motiondb.seed('My Database');
-dv.paragraph(`Seeded: ${result.ok} statements OK, ${result.errors.length} errors`);
-if (result.errors.length) dv.paragraph(result.errors.map(e => e.message).join('\n'));
+if (books.length === 0) {
+  dv.paragraph(`No books marked "${status}" yet.`);
+} else {
+  dv.table(
+    ["Title", "Status"],
+    books.map(book => [book.title, book.status])
+  );
+}
 ```
 ````
 
-### 2. Simple table query
+`create()` can also return an existing database. `CREATE TABLE IF NOT EXISTS`
+makes the schema setup safe when Dataview reruns the block. The `$1` SQL
+parameter is filled from `[status]`; use parameters for values from note
+properties or user input instead of concatenating those values into SQL.
 
-````js
+## API reference
+
+| Call | Returns | Use |
+| --- | --- | --- |
+| `window.motiondb.create(name)` | `Promise<MotionDB>` | Create or open a database. |
+| `window.motiondb.open(name)` | `Promise<MotionDB>` | Open an existing database; rejects if it cannot be found. |
+| `window.motiondb.list()` | `Promise<{name, tables[]}[]>` | List database names and their tables. |
+| `window.motiondb.select(name, sql, params?)` | `Promise<object[]>` | Run a query and return plain row objects. |
+| `window.motiondb.query(name, sql, params?)` | `Promise<Result[]>` | Run SQL and return raw results, one per statement. |
+| `window.motiondb.seed(name)` | `Promise<{ok, errors}>` | Add the built-in Northwind demo schema and data to an existing database. |
+| `window.motiondb.subscribe(callback)` | `() => void` | Listen for saved database changes; returns an unsubscribe function. |
+
+`select()` returns rows like `[{ title: "The Dispossessed", status: "reading" }]`.
+`query()` returns row results as `{ type: "rows", columns, rows }` and write
+results as `{ type: "ok", message, count }`. SQL errors reject the promise.
+Positional parameters use `$1`, `$2`, and so on:
+
+````markdown
 ```dataviewjs
-const rows = await motiondb.select('My Database', `
-  SELECT name, country, city
-  FROM customers
-  ORDER BY name ASC
-`);
-
-if (!rows.length) { dv.paragraph('No rows.'); return; }
-dv.table(Object.keys(rows[0]), rows.map(r => Object.values(r)));
-```
-````
-
-### 3. JOIN across tables
-
-````js
-```dataviewjs
-const rows = await motiondb.select('My Database', `
-  SELECT
-    c.name      AS customer,
-    o.order_date,
-    o.status,
-    SUM(oi.quantity * oi.unit_price) AS total
-  FROM customers c
-  JOIN orders o        ON o.customer_id = c.id
-  JOIN order_items oi  ON oi.order_id   = o.id
-  GROUP BY o.id
-  ORDER BY o.order_date DESC
-`);
-
-dv.table(['Customer', 'Date', 'Status', 'Total'], rows.map(r => [
-  r.customer,
-  r.order_date,
-  r.status,
-  '$' + r.total.toFixed(2)
-]));
-```
-````
-
-### 4. Query the built-in views
-
-````js
-```dataviewjs
-// order_totals view: order_id, customer, status, total
-const rows = await motiondb.select('My Database',
-  'SELECT * FROM order_totals ORDER BY total DESC LIMIT 5'
+const rows = await window.motiondb.select(
+  "Reading Log",
+  "SELECT title FROM books WHERE status = $1 AND title LIKE $2 ORDER BY title",
+  ["reading", "The%"]
 );
-dv.table(Object.keys(rows[0]), rows.map(r => Object.values(r)));
+
+dv.table(["Title"], rows.map(book => [book.title]));
 ```
 ````
 
-````js
+`window.motiondb.version` reports the public API version. The current API
+version is `2`.
+
+## Add or update data
+
+For ordinary editing, use the Motion Database view or an interactive
+`motiondb` note embed. If another integration needs to write, use bound
+parameters. Writes are saved in the background after `query()` returns. Call
+`flushSave()` on the database instance when your integration must wait for the
+vault write to finish.
+
+````markdown
 ```dataviewjs
-// product_revenue view: product, category, units_sold, revenue
-const rows = await motiondb.select('My Database',
-  'SELECT * FROM product_revenue ORDER BY revenue DESC'
+const db = await window.motiondb.open("Reading Log");
+await db.query(
+  "INSERT INTO books (title, status) VALUES ($1, $2)",
+  ["A Wizard of Earthsea", "to-read"]
 );
-dv.table(['Product', 'Category', 'Units Sold', 'Revenue'],
-  rows.map(r => [r.product, r.category, r.units_sold, '$' + r.revenue]));
+await db.flushSave();
+dv.paragraph("Book saved.");
 ```
 ````
 
-### 5. Aggregates and stats
+Dataview blocks rerun when views refresh. Do not put a non-idempotent `INSERT`
+in a block that renders repeatedly unless you want a new row on every run.
 
-````js
+## Optional demo database
+
+To explore the SQL engine with fictional Northwind sample data, create a new
+database and seed it once:
+
+````markdown
 ```dataviewjs
-const [summary] = await motiondb.query('My Database', `
-  SELECT
-    COUNT(DISTINCT customer_id) AS customers,
-    COUNT(*)                    AS orders,
-    ROUND(SUM(total), 2)        AS revenue
-  FROM order_totals
-`);
-
-const row = summary.rows[0];
-dv.paragraph(`
-**Customers:** ${row[0]}  
-**Orders:** ${row[1]}  
-**Total Revenue:** $${row[2]}
-`);
+const name = "Northwind Demo";
+await window.motiondb.create(name);
+const result = await window.motiondb.seed(name);
+dv.paragraph(`Created ${result.ok} statements; ${result.errors.length} errors.`);
 ```
 ````
 
-### 6. Filtering with parameters
+Run `seed()` only once for a fresh demo database. It inserts sample rows, so
+repeating it can produce duplicate-key errors.
 
-````js
-```dataviewjs
-const country = 'Germany'; // swap this for dv.current().country etc.
+## Use the API from another Obsidian plugin
 
-const rows = await motiondb.select('My Database', `
-  SELECT name, city, email
-  FROM customers
-  WHERE country = '${country}'
-  ORDER BY name ASC
-`);
+The same global is available to another plugin after Motion Database loads.
+Check it before use, then register the returned unsubscribe function with the
+plugin lifecycle if you subscribe to changes. For TypeScript, add the
+`MotionDatabasePublicApi` declaration from `src/global.d.ts` to your plugin's
+types; the example assumes that declaration is present:
 
-dv.header(3, `Customers in ${country}`);
-if (!rows.length) { dv.paragraph('None found.'); return; }
-dv.table(['Name', 'City', 'Email'], rows.map(r => [r.name, r.city, r.email]));
-```
-````
+```ts
+const api = window.motiondb;
+if (!api) throw new Error("Motion Database is not enabled.");
 
-### 7. Low-stock product alert
+const db = await api.open("Reading Log");
+const rows = await api.select(
+  "Reading Log",
+  "SELECT title FROM books WHERE status = $1",
+  ["reading"]
+);
 
-````js
-```dataviewjs
-const rows = await motiondb.select('My Database', `
-  SELECT p.name, cat.name AS category, p.stock, p.unit_price
-  FROM products p
-  JOIN categories cat ON p.category_id = cat.id
-  WHERE p.stock < 20
-  ORDER BY p.stock ASC
-`);
-
-dv.header(3, '⚠️ Low Stock Products');
-dv.table(['Product', 'Category', 'Stock', 'Price'],
-  rows.map(r => [r.name, r.category, r.stock, '$' + r.unit_price]));
-```
-````
-
-### 8. Write data from DataviewJS (INSERT/UPDATE)
-
-````js
-```dataviewjs
-// Insert a new customer
-await motiondb.query('My Database', `
-  INSERT INTO customers (name, email, country, city)
-  VALUES ('New Customer', 'new@example.com', 'PH', 'Manila')
-`);
-
-dv.paragraph('Customer added.');
-```
-````
-
----
-
-## Sample SQL Queries for the Terminal
-
-These work directly in the built-in SQL terminal:
-
-```sql
--- All tables
-SHOW TABLES;
-
--- Schema of a table
-DESCRIBE products;
-
--- Top 5 products by revenue
-SELECT p.name, SUM(oi.quantity * oi.unit_price) AS revenue
-FROM order_items oi
-JOIN products p ON oi.product_id = p.id
-GROUP BY p.id
-ORDER BY revenue DESC
-LIMIT 5;
-
--- Orders with totals
-SELECT * FROM order_totals ORDER BY total DESC;
-
--- Products per category
-SELECT cat.name AS category, COUNT(*) AS products, ROUND(AVG(p.unit_price),2) AS avg_price
-FROM products p
-JOIN categories cat ON p.category_id = cat.id
-GROUP BY cat.id
-ORDER BY products DESC;
-
--- Customers with no orders (LEFT JOIN + IS NULL)
-SELECT c.name, c.country
-FROM customers c
-LEFT JOIN orders o ON o.customer_id = c.id
-WHERE o.id IS NULL;
-
--- Order items with full detail
-SELECT
-  c.name     AS customer,
-  o.order_date,
-  p.name     AS product,
-  oi.quantity,
-  oi.unit_price,
-  ROUND(oi.quantity * oi.unit_price, 2) AS line_total
-FROM customers c
-JOIN orders o       ON o.customer_id = c.id
-JOIN order_items oi ON oi.order_id   = o.id
-JOIN products p     ON oi.product_id = p.id
-ORDER BY o.order_date DESC, line_total DESC;
+const unsubscribe = api.subscribe(change => {
+  if (change.name === "Reading Log") refreshView();
+});
+this.register(unsubscribe);
 ```
 
----
+The change object contains `name` and `filePath`. Use `api.create(name)` for
+create-or-open behavior. `api.open(name)` requires an existing database.
 
-## Notes
+## Related ways to display data
 
-- The database file lives at `motion-databases/<name>.motiondb.json` in your vault.
-- All data is stored as JSON — back it up like any other vault file.
-- `motiondb.seed()` uses `IF NOT EXISTS` on every statement, so it's safe to call multiple times.
-- DataviewJS blocks re-run on every file open/reload, so queries are always fresh.
+- Use a read-only `motiondb` code block to embed a table or SQL result directly
+  in a note; add `interactive: true` to edit a table with a primary key.
+- Use the built-in SQL terminal for direct SQL work.
+- Use the **Motion Database query** Bases layout on Obsidian 1.10 or later.
+
+See the main [README](README.md) for those examples and
+[SQL compatibility](COMPATIBILITY.md) for the supported grammar.

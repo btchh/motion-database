@@ -1,110 +1,185 @@
 # Motion Database
 
-Motion Database is a local-first relational database embedded in an Obsidian
-vault. It provides a PostgreSQL-familiar SQL subset through a native workspace
-and a DataviewJS API.
+Motion Database stores relational databases in your Obsidian vault. Create
+tables and query them with SQL, then use the results in notes, DataviewJS, or
+another Obsidian plugin.
+
+## Install and create a database
+
+1. Install and enable **Motion Database** in Obsidian.
+2. Open the command palette and run **Motion Database: Open or create**, or
+   click the database icon in the ribbon.
+3. Create or open a database in the Motion Database home view.
+
+Databases are stored as JSON files under `motion-databases/` at the vault root.
+Back up that folder with the rest of your vault. The plugin release contains
+the plugin code, not your database files.
+
+## Use SQL in the Motion Database view
+
+Open a database, then use its SQL terminal. For example:
+
+```sql
+CREATE TABLE books (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'to-read'
+);
+
+INSERT INTO books (title, status) VALUES ('The Dispossessed', 'reading');
+SELECT title, status FROM books ORDER BY title;
+```
+
+The engine supports a PostgreSQL-inspired SQL subset. See
+[SQL compatibility](COMPATIBILITY.md) for supported statements and differences.
+
+## Use Motion Database from DataviewJS
+
+Install and enable Dataview as well as Motion Database. In Dataview settings,
+turn on **Enable JavaScript queries**. DataviewJS can access your vault and run
+JavaScript, so only enable scripts you trust. See the [DataviewJS API
+overview](https://blacksmithgu.github.io/obsidian-dataview/api/intro/) and
+[code block reference](https://blacksmithgu.github.io/obsidian-dataview/api/code-reference/).
+
+Use a `dataviewjs` block. Dataview provides `dv` for rendering; Motion Database
+provides the global `window.motiondb` for opening the database and running SQL.
+This example creates a database and table if needed, then renders matching
+rows. Set `status: reading` in the note's YAML properties to choose the filter;
+add or edit rows in the Motion Database view.
+
+````markdown
+---
+status: reading
+---
+
+```dataviewjs
+const databaseName = "Reading Log";
+const db = await window.motiondb.create(databaseName);
+
+await db.query(`
+  CREATE TABLE IF NOT EXISTS books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'to-read'
+  )
+`);
+await db.flushSave();
+
+const status = String(dv.current().status ?? "reading");
+const books = await window.motiondb.select(
+  databaseName,
+  "SELECT title, status FROM books WHERE status = $1 ORDER BY title",
+  [status]
+);
+
+if (books.length === 0) {
+  dv.paragraph(`No books marked "${status}" yet. Add a row in Motion Database.`);
+} else {
+  dv.table(
+    ["Title", "Status"],
+    books.map(book => [book.title, book.status])
+  );
+}
+```
+````
+
+The `$1` placeholder is bound to the first value in `[status]`. Use bound
+parameters for values that come from note properties or user input; do not
+build SQL by concatenating those values into the query string. More examples
+are in the [DataviewJS integration guide](DATAVIEWJS_GUIDE.md).
+
+## Call the API from another plugin
+
+The same global API is available to other Obsidian plugins after Motion
+Database loads. `create()` creates a database if needed; `open()` expects an
+existing database. `list()` returns database names and table names.
+
+```js
+const api = window.motiondb;
+if (!api) throw new Error("Enable Motion Database before this integration.");
+
+const databases = await api.list();
+const db = await api.create("Reading Log");
+const books = await api.select(
+  "Reading Log",
+  "SELECT title FROM books WHERE status = $1 ORDER BY title",
+  ["reading"]
+);
+```
+
+Use `select()` for row objects (`[{ title: "..." }]`). Use `query()` when you
+need raw result objects: each statement returns either `{ type: "rows",
+columns, rows }` or `{ type: "ok", message, count }`.
+
+Writes through `query()` are saved in the background. If your integration must
+wait until a write reaches the vault, use the open database instance and
+`flushSave()`:
+
+```js
+const db = await window.motiondb.open("Reading Log");
+await db.query(
+  "INSERT INTO books (title, status) VALUES ($1, $2)",
+  ["A Wizard of Earthsea", "to-read"]
+);
+await db.flushSave();
+```
+
+Other available calls include `window.motiondb.seed(name)` for the built-in
+Northwind demo data and `window.motiondb.subscribe(callback)` for database
+change notifications. The current public API version is available as
+`window.motiondb.version`. The source repository includes TypeScript API
+declarations in `src/global.d.ts`; copy a compatible declaration into your
+plugin if you want compile-time types for `window.motiondb`.
+
+## Embed a table or query in a note
+
+For a simple table, use a `motiondb` block instead of DataviewJS:
+
+````markdown
+```motiondb
+database: Reading Log
+table: books
+limit: 25
+```
+````
+
+Table embeds are read-only by default. Add `interactive: true` to edit rows in
+the note; the table must have a primary key. For a filtered or sorted result,
+put one read-only SQL query after the database line:
+
+````markdown
+```motiondb
+database: Reading Log
+SELECT title, status FROM books WHERE status = 'reading' ORDER BY title
+```
+````
+
+Column display formats are configured in the table's **Structure** dialog and
+are shared by the database view and embeds.
+
+## Dataview, Bases, and other integrations
+
+- **DataviewJS:** call `window.motiondb.select()` or
+  `window.motiondb.query()` inside a `dataviewjs` block, then render with
+  `dv.table()`, `dv.list()`, or other Dataview methods.
+- **Bases:** on Obsidian 1.10 or later, select the **Motion Database query**
+  layout and provide a database name and read-only SQL query.
+- **Other plugins:** call the global API after Motion Database loads. Use
+  `subscribe()` when a plugin needs to refresh after database changes.
 
 ## Development
 
-Obsidian executes the generated `main.js`. The maintained source is
-`src/main.ts`.
-
-The first migration preserves the legacy engine in one TypeScript entry point
-so behavior remains reviewable against the previous release. It is explicitly
-marked as transitional; the regression suite is the safety net for splitting
-the parser, executor, persistence service, integrations, and views into fully
-typed modules.
+The maintained source is `src/main.ts`; Obsidian loads the generated
+`main.js`.
 
 1. Install Node.js 20 or later.
 2. Run `npm install`.
-3. Run `npm run dev` while developing, or `npm run build` for a release.
+3. Run `npm run dev` while developing or `npm run build` for a release.
+4. Run `npm test` to execute the SQL engine regression suite.
 
-## Data safety
+## Data and compatibility
 
-Database files live in `motion-databases/`. Writes are serialized per
-database and staged through a temporary file before replacing the stored
-snapshot. All plugin views and public API calls share one in-memory database
-instance per file.
-
-## Public API
-
-```js
-await motiondb.create('My Database'); // safe to call when bootstrapping an app
-
-const rows = await motiondb.select('My Database',
-  'SELECT * FROM customers ORDER BY name');
-
-await motiondb.query('My Database',
-  "INSERT INTO customers (name) VALUES ('Ada')");
-```
-
-Public write calls persist before their promises resolve. A transaction can
-span calls to `motiondb.query`; changes are persisted when `COMMIT`
-completes and discarded when `ROLLBACK` completes.
-
-### Markdown query blocks
-
-Embed a whole table in any note with a `motiondb` code block:
-
-````markdown
-```motiondb
-database: My Database
-table: customers
-```
-````
-
-Add `limit: 100` to show only the first 100 rows. Embedded tables update when
-the database changes and are read-only by default.
-
-To edit cells directly from the note, add `interactive: true`. Interactive
-tables must have a primary key. Click a non-key cell, then press Enter or click
-away to save; press Escape to cancel. Use **Add row** above the table to insert
-records; blank fields use the column default or `NULL`. Use the trash button in the pinned row-actions column to delete a row after confirmation.
-
-Column presentation is part of the database schema, so every view and embed is
-consistent. Open a table's **Structure** dialog and choose a presentation for
-each column:
-
-- Boolean values can use a checkbox presentation and still store true/false.
-- Numeric values can display as stars, hearts, or a number rating with a
-  configurable maximum. Changing the presentation does not change the value.
-
-Legacy embed-level `properties:` and `types:` lines are still understood for
-older notes, but new embeds inherit their presentation from the column.
-
-For filtered or sorted results, put one read-only SQL query after the database
-line instead:
-
-````markdown
-```motiondb
-database: My Database
-SELECT id, name FROM customers ORDER BY name
-```
-````
-
-### Bases
-
-On Obsidian 1.10 or later, choose the **Motion Database query** layout for a
-Base view. Configure the database name and one read-only SQL statement in the
-view options. Bases continues to own its file query model; this layout uses the
-supported custom-view API to present Motion Database results inside the Bases
-workspace.
-
-See [DATAVIEWJS_GUIDE.md](DATAVIEWJS_GUIDE.md) for more examples.
-
-## Editor utility
-
-The command palette includes **Motion Database: Editor: Prefix selected lines
-with blockquote**. Select one or more lines and run it to add `> ` to every
-selected line. Assign a shortcut in **Settings → Hotkeys**. Unlike Obsidian's
-toggle command, repeated use adds another quote level instead of removing it.
-
-## Compatibility
-
-The SQL engine is PostgreSQL-inspired, not a complete PostgreSQL server. The
-supported grammar and behavioral differences will be tracked explicitly as the
-engine is hardened.
-
-Row actions stay visible while tables scroll horizontally. Desktop and embedded tables reserve room for their buttons, mobile controls use larger touch targets, and embedded prose wraps instead of forcing unbounded column widths. New rows in the database editor use the same editing and deletion handlers as existing rows. Embedded cell keyboard shortcuts apply to the cell itself, allowing spaces and Enter to work normally inside its input.
-
-Embedded tables use natural column widths when wider than the pane. Short values stay on one line when they fit their column; longer text wraps at 24rem on desktop and 16rem on mobile. Row actions remain pinned while scrolling.
+Writes are serialized per database and saved through a temporary snapshot
+before replacing the previous file. The plugin is local-first; it is not a
+PostgreSQL server and does not provide network connections or multi-process
+database access. See [SQL compatibility](COMPATIBILITY.md).

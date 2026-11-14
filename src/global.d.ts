@@ -1,20 +1,42 @@
 export {};
 
 declare global {
+  interface MotionDatabaseRowsResult {
+    type: 'rows';
+    columns: string[];
+    rows: unknown[][];
+  }
+
+  interface MotionDatabaseOkResult {
+    type: 'ok';
+    message: string;
+    count?: number;
+  }
+
+  type MotionDatabaseResult = MotionDatabaseRowsResult | MotionDatabaseOkResult;
+
+  interface MotionDatabaseInstance {
+    readonly name: string;
+    query(sql: string, parameters?: unknown[]): Promise<MotionDatabaseResult[]>;
+    exec(sql: string): MotionDatabaseResult[];
+    tables(): string[];
+    flushSave(): Promise<void>;
+  }
+
   interface Window {
     motiondb?: MotionDatabasePublicApi;
-    _motionDBRegistry?: Record<string, unknown>;
+    _motionDBRegistry?: Record<string, MotionDatabaseInstance>;
   }
 
   interface MotionDatabasePublicApi {
     readonly version: number;
-    create(name: string): Promise<unknown>;
-    open(name: string): Promise<unknown>;
-    query(database: string, sql: string, parameters?: unknown[]): Promise<unknown[]>;
+    create(name: string): Promise<MotionDatabaseInstance>;
+    open(name: string): Promise<MotionDatabaseInstance>;
+    query(database: string, sql: string, parameters?: unknown[]): Promise<MotionDatabaseResult[]>;
     select(database: string, sql: string, parameters?: unknown[]): Promise<Record<string, unknown>[]>;
     list(): Promise<Array<{ name: string; tables: string[] }>>;
-    exec(database: unknown, sql: string, parameters?: unknown[]): Promise<unknown[]>;
-    seed(database: string): Promise<{ ok: number; errors: unknown[] }>;
+    exec(database: MotionDatabaseInstance, sql: string, parameters?: unknown[]): Promise<MotionDatabaseResult[]>;
+    seed(database: string): Promise<{ ok: number; errors: Array<{ type: string; message: string }> }>;
     subscribe(callback: (change: { name: string; filePath: string }) => void): () => void;
   }
 }
