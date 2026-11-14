@@ -3854,6 +3854,7 @@ body.is-mobile :is(.mdb-del-btn,.mdb-query-delete-button) svg {
 }
 .mdb-sidebar .vertical-tab-nav-item {
   min-width: 0;
+  gap: var(--size-4-2);
 }
 .mdb-sidebar .mdb-nav-icon {
   color: var(--icon-color);
